@@ -196,21 +196,22 @@ fn test_current_chunk_index_with_variable_length_chunks() {
 }
 
 #[test]
-fn test_backspace_reconverts_last_chunk_partition() {
-    // Deleting a char at the end re-partitions: the final chunk shrinks while
-    // earlier chunks keep their readings (and are served from cache).
+fn test_backspace_clears_chunks_until_next_live_refresh() {
+    // Backspace is a destructive correction gesture: keep the preedit in raw
+    // reading form and drop cached conversions so stale live text cannot be
+    // reused while the user is figuring out what remains.
     let mut engine = make_chunk_engine(2);
     type_aiue(&mut engine); // ["あい", "うえ"]
     assert_eq!(engine.chunks.len(), 2);
 
     engine.process_key(&press_key(Keysym::BACKSPACE)); // "あいう" → ["あい", "う"]
     assert_eq!(engine.input_buf.text, "あいう");
-    let readings: Vec<&str> = engine.chunks.iter().map(|s| s.reading.as_str()).collect();
-    assert_eq!(readings, vec!["あい", "う"]);
-    // First chunk keeps an empty left context; the surviving last chunk's
-    // left context is the first chunk's converted value.
-    assert_eq!(engine.chunk_lctx(0), "");
-    assert_eq!(engine.chunk_lctx(1), engine.chunks[0].converted);
+    assert!(engine.live.text.is_empty());
+    assert!(engine.chunks.is_empty());
+
+    engine.process_key(&press('o'));
+    assert_eq!(engine.input_buf.text, "あいうお");
+    assert!(!engine.chunks.is_empty());
 }
 
 #[test]
@@ -260,10 +261,9 @@ fn type_aiueoka(engine: &mut InputMethodEngine) {
 }
 
 #[test]
-fn test_delete_first_chunk_reuses_remaining_suffix() {
-    // Deleting the first chunk leaves the rest as an unchanged common suffix,
-    // so the surviving chunk is REUSED (not reconverted) to save cost — its
-    // cached conversion is kept even though it is now the leading chunk.
+fn test_delete_from_front_clears_chunks_until_next_live_refresh() {
+    // Deleting from the front should not keep an unchanged suffix conversion
+    // on screen; the user needs to see the raw remaining reading.
     let mut engine = make_chunk_engine(2);
     type_aiue(&mut engine); // "あいうえ" → ["あい", "うえ"]
     assert_eq!(engine.chunks.len(), 2);
@@ -275,16 +275,14 @@ fn test_delete_first_chunk_reuses_remaining_suffix() {
     engine.process_key(&press_key(Keysym::DELETE));
 
     assert_eq!(engine.input_buf.text, "うえ");
-    let readings: Vec<&str> = engine.chunks.iter().map(|s| s.reading.as_str()).collect();
-    assert_eq!(readings, vec!["うえ"]);
-    // Reused from the suffix → cached conversion survives (no reconvert).
-    assert_eq!(engine.chunks[0].converted, "SENTINEL");
+    assert!(engine.live.text.is_empty());
+    assert!(engine.chunks.is_empty());
 }
 
 #[test]
-fn test_middle_delete_reconverts_only_touched_chunk() {
-    // Deleting a character inside the middle chunk reconverts ONLY that
-    // chunk; the leading and trailing neighbors are reused untouched.
+fn test_middle_delete_clears_chunks_until_next_live_refresh() {
+    // Deleting inside the middle of a composition should not keep neighboring
+    // cached conversions visible; raw reading is the legible correction mode.
     let mut engine = make_chunk_engine(2);
     type_aiueoka(&mut engine); // "あいうえおか" → ["あい", "うえ", "おか"]
     assert_eq!(engine.chunks.len(), 3);
@@ -299,11 +297,8 @@ fn test_middle_delete_reconverts_only_touched_chunk() {
     engine.process_key(&press_key(Keysym::BACKSPACE));
 
     assert_eq!(engine.input_buf.text, "あいえおか");
-    let readings: Vec<&str> = engine.chunks.iter().map(|s| s.reading.as_str()).collect();
-    assert_eq!(readings, vec!["あい", "え", "おか"]);
-    // Neighbors reused (sentinels survive); only the middle chunk reconverted.
-    assert_eq!(engine.chunks[0].converted, "S0");
-    assert_eq!(engine.chunks[2].converted, "S2");
+    assert!(engine.live.text.is_empty());
+    assert!(engine.chunks.is_empty());
 }
 
 #[test]

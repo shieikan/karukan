@@ -11,6 +11,8 @@ fn append_candidates_dedup(target: &mut Vec<Candidate>, source: Vec<Candidate>) 
     }
 }
 
+const LIVE_CONVERSION_MIN_READING_CHARS: usize = 3;
+
 impl InputMethodEngine {
     /// Refresh the input state: rebuild preedit and run auto-suggest for candidates.
     pub(super) fn refresh_input_state(&mut self) -> EngineResult {
@@ -36,6 +38,21 @@ impl InputMethodEngine {
         let convert = !self.input_buf.text.is_empty()
             && (self.mode.current() != InputMode::Alphabet
                 || karukan_engine::contains_kana(&self.input_buf.text));
+        let defer_live_candidates = self.live.enabled
+            && matches!(self.mode.current(), InputMode::Hiragana | InputMode::Alphabet);
+        if self.live.enabled
+            && self.mode.current() == InputMode::Hiragana
+            && self.input_buf.text.chars().count() < LIVE_CONVERSION_MIN_READING_CHARS
+        {
+            self.live.text.clear();
+            self.chunks.clear();
+            let preedit = self.set_composing_state();
+            return EngineResult::consumed()
+                .with_action(EngineAction::UpdatePreedit(preedit))
+                .with_action(EngineAction::HideCandidates)
+                .with_action(EngineAction::UpdateAuxText(self.format_aux_composing()));
+        }
+
         let candidates = if convert {
             let reading = self.input_buf.text.clone();
             self.chunked_auto_suggest()
@@ -46,11 +63,23 @@ impl InputMethodEngine {
         };
 
         let Some((candidates, reading)) = candidates else {
-            // No useful AI suggestion — still show learning + dictionary + rule-based
-            // rewriter variants. The rewriter path produces mozc-style symbol variants
-            // (e.g. `「` → `『`, `【`, ...) for symbol-only inputs where the model is skipped.
+            // No useful AI suggestion. In live conversion mode, keep composing
+            // quiet and defer ordinary candidate display until explicit
+            // conversion. Explicit picker modes such as Emoji still surface
+            // their rewriter candidates while composing.
             self.live.text.clear();
             let preedit = self.set_composing_state();
+            if defer_live_candidates {
+                return EngineResult::consumed()
+                    .with_action(EngineAction::UpdatePreedit(preedit))
+                    .with_action(EngineAction::HideCandidates)
+                    .with_action(EngineAction::UpdateAuxText(self.format_aux_composing()));
+            }
+
+            // Without live conversion, preserve the existing auto-suggest list
+            // of learning + dictionary + rule-based rewriter variants. The
+            // rewriter path produces mozc-style symbol variants (e.g. `「` →
+            // `『`, `【`, ...) for symbol-only inputs where the model is skipped.
             let reading = self.input_buf.text.clone();
             let mut all_candidates = self.lookup_learning_candidates(&reading);
             append_candidates_dedup(&mut all_candidates, self.lookup_dict_candidates(&reading));
@@ -70,9 +99,14 @@ impl InputMethodEngine {
         };
 
         // Live conversion mode: show converted text in preedit
-        if self.live.enabled && self.mode.current() != InputMode::Katakana {
+        if defer_live_candidates {
             self.live.text = candidates[0].clone();
-            return self.suggest_result(candidates, &reading);
+            let preedit = self.set_composing_state();
+            let aux = self.format_aux_suggest(&self.input_buf.text.clone());
+            return EngineResult::consumed()
+                .with_action(EngineAction::UpdatePreedit(preedit))
+                .with_action(EngineAction::HideCandidates)
+                .with_action(EngineAction::UpdateAuxText(aux));
         }
 
         // Normal auto-suggest: show hiragana preedit
@@ -80,14 +114,13 @@ impl InputMethodEngine {
         self.suggest_result(candidates, &reading)
     }
 
-    /// Build the auto-suggest result shared by live conversion and normal
-    /// auto-suggest: composing preedit, candidate list, and aux text.
+    /// Build the auto-suggest result: composing preedit, candidate list, and
+    /// aux text. Used when candidates are *not* deferred — i.e. live conversion
+    /// is off, or the mode is an explicit picker (Katakana, Emoji).
     ///
     /// Candidate ordering is learning → model → dictionary. Including the
     /// model candidates guarantees the list is never empty, so the candidate
-    /// window — whose aux line is where frontends show the raw reading once
-    /// the preedit displays converted text — stays on screen for the whole
-    /// live conversion.
+    /// window stays on screen for the whole composition.
     fn suggest_result(&mut self, candidates: Vec<String>, reading: &str) -> EngineResult {
         let preedit = self.set_composing_state();
         let mut all_candidates = self.lookup_learning_candidates(reading);

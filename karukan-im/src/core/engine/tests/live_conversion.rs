@@ -2,6 +2,38 @@ use super::*;
 
 // --- Live conversion tests ---
 
+fn updated_preedit_text(result: &EngineResult) -> Option<String> {
+    result.actions.iter().find_map(|a| {
+        if let EngineAction::UpdatePreedit(p) = a {
+            Some(p.text().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn has_show_candidates(result: &EngineResult) -> bool {
+    result
+        .actions
+        .iter()
+        .any(|a| matches!(a, EngineAction::ShowCandidates(_)))
+}
+
+fn has_hide_candidates(result: &EngineResult) -> bool {
+    result
+        .actions
+        .iter()
+        .any(|a| matches!(a, EngineAction::HideCandidates))
+}
+
+fn conversion_state_texts(engine: &InputMethodEngine) -> Vec<String> {
+    engine
+        .state()
+        .candidates()
+        .map(|cl| cl.candidates().iter().map(|c| c.text.clone()).collect())
+        .unwrap_or_default()
+}
+
 #[test]
 fn test_live_conversion_disabled_by_default() {
     let engine = InputMethodEngine::new();
@@ -12,6 +44,165 @@ fn test_live_conversion_disabled_by_default() {
 fn test_live_conversion_enabled() {
     let engine = make_live_conversion_engine();
     assert!(engine.live.enabled);
+}
+
+#[test]
+fn test_live_conversion_suppresses_candidates_until_explicit_conversion() {
+    let mut engine = make_live_conversion_engine();
+
+    engine.process_key(&press('a'));
+    let result = engine.process_key(&press('i'));
+
+    assert!(
+        !has_show_candidates(&result),
+        "live conversion should not open the candidate window while composing"
+    );
+
+    let result = engine.process_key(&press_key(Keysym::SPACE));
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::ShowCandidates(_))),
+        "explicit Space conversion should still open the candidate window"
+    );
+}
+
+#[test]
+fn test_live_conversion_keeps_converted_preedit_but_hides_candidates_for_long_reading() {
+    let mut engine = make_live_conversion_engine();
+    engine.input_buf.insert("ばあい");
+    engine.chunks = vec![ComposingChunk {
+        reading: "ばあい".to_string(),
+        converted: "場合".to_string(),
+    }];
+
+    let result = engine.refresh_input_state();
+
+    assert_eq!(engine.live.text, "場合");
+    assert_eq!(updated_preedit_text(&result).as_deref(), Some("場合"));
+    assert!(
+        !has_show_candidates(&result),
+        "live conversion should update preedit without opening candidates"
+    );
+    assert!(
+        has_hide_candidates(&result),
+        "live conversion should explicitly keep the candidate window closed"
+    );
+}
+
+#[test]
+fn test_live_conversion_suppresses_symbol_rewriter_until_explicit_conversion() {
+    let mut engine = make_live_conversion_engine();
+    engine.process_key(&press('.'));
+    engine.process_key(&press('.'));
+    let result = engine.process_key(&press('.'));
+
+    assert_eq!(engine.input_buf.text, "。。。");
+    assert!(
+        !has_show_candidates(&result),
+        "ordinary symbol suggestions should stay hidden during live conversion"
+    );
+    assert!(has_hide_candidates(&result));
+
+    engine.process_key(&press_key(Keysym::SPACE));
+    assert!(
+        conversion_state_texts(&engine).iter().any(|t| t == "…"),
+        "explicit Space conversion should still show symbol rewriter candidates"
+    );
+}
+
+#[test]
+fn test_live_conversion_waits_for_enough_reading_before_showing_conversion() {
+    let mut engine = make_live_conversion_engine();
+    engine.input_buf.insert("ばあ");
+    engine.chunks = vec![ComposingChunk {
+        reading: "ばあ".to_string(),
+        converted: "婆".to_string(),
+    }];
+
+    let result = engine.refresh_input_state();
+
+    assert!(
+        engine.live.text.is_empty(),
+        "short ambiguous fragments should stay in raw reading form"
+    );
+    assert_eq!(updated_preedit_text(&result).as_deref(), Some("ばあ"));
+}
+
+#[test]
+fn test_live_conversion_backspace_shows_raw_reading_while_deleting() {
+    let mut engine = InputMethodEngine::with_config(EngineConfig {
+        live_conversion: true,
+        composing_chunk_len: 2,
+        ..EngineConfig::default()
+    });
+    engine.input_buf.insert("ばあい");
+    engine.chunks = vec![
+        ComposingChunk {
+            reading: "ばあ".to_string(),
+            converted: "婆".to_string(),
+        },
+        ComposingChunk {
+            reading: "い".to_string(),
+            converted: "い".to_string(),
+        },
+    ];
+    engine.live.text = "婆い".to_string();
+    engine.set_composing_state();
+
+    let result = engine.process_key(&press_key(Keysym::BACKSPACE));
+
+    assert_eq!(engine.input_buf.text, "ばあ");
+    assert!(engine.live.text.is_empty());
+    assert_eq!(updated_preedit_text(&result).as_deref(), Some("ばあ"));
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::HideCandidates)),
+        "deleting should keep the candidate window closed"
+    );
+}
+
+#[test]
+fn test_live_conversion_delete_shows_raw_reading_while_deleting() {
+    let mut engine = InputMethodEngine::with_config(EngineConfig {
+        live_conversion: true,
+        composing_chunk_len: 1,
+        ..EngineConfig::default()
+    });
+    engine.input_buf.insert("ばあい");
+    engine.input_buf.cursor_pos = 0;
+    engine.chunks = vec![
+        ComposingChunk {
+            reading: "ば".to_string(),
+            converted: "婆".to_string(),
+        },
+        ComposingChunk {
+            reading: "あ".to_string(),
+            converted: "亜".to_string(),
+        },
+        ComposingChunk {
+            reading: "い".to_string(),
+            converted: "意".to_string(),
+        },
+    ];
+    engine.live.text = "婆亜意".to_string();
+    engine.set_composing_state();
+
+    let result = engine.process_key(&press_key(Keysym::DELETE));
+
+    assert_eq!(engine.input_buf.text, "あい");
+    assert!(engine.live.text.is_empty());
+    assert_eq!(updated_preedit_text(&result).as_deref(), Some("あい"));
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::HideCandidates)),
+        "deleting should keep the candidate window closed"
+    );
 }
 
 #[test]

@@ -77,6 +77,26 @@ fn emoji_mode_shows_candidates_via_rewriter() {
 }
 
 #[test]
+fn emoji_mode_shows_candidates_when_live_conversion_is_enabled() {
+    // Live conversion suppresses ordinary kana/symbol suggestion popups, but
+    // emoji mode is an explicit picker entered with `:`, so shortcode matches
+    // should stay visible while composing.
+    let mut engine = make_live_conversion_engine();
+    engine.process_key(&press_colon());
+    for ch in ['s', 'm', 'i', 'l'] {
+        engine.process_key(&press(ch));
+    }
+    let last = engine.process_key(&press('e'));
+
+    let texts = auto_suggest_texts(&last);
+    assert!(
+        texts.iter().any(|t| t == "😄"),
+        "expected 😄 in live-conversion emoji candidates, got {:?}",
+        texts
+    );
+}
+
+#[test]
 fn escape_commits_literal_and_exits_emoji_mode() {
     // Slack-style escape: pressing ESC in emoji mode dismisses the
     // picker AND commits whatever the user typed as plain text. Two

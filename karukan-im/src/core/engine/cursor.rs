@@ -3,6 +3,18 @@
 use super::*;
 
 impl InputMethodEngine {
+    /// After a destructive edit, show the raw reading so repeated Backspace/Delete
+    /// is legible instead of live-converting every intermediate fragment.
+    fn show_raw_composing_after_edit(&mut self) -> EngineResult {
+        self.live.text.clear();
+        self.chunks.clear();
+        let preedit = self.set_composing_state();
+        EngineResult::consumed()
+            .with_action(EngineAction::UpdatePreedit(preedit))
+            .with_action(EngineAction::HideCandidates)
+            .with_action(EngineAction::UpdateAuxText(self.format_aux_composing()))
+    }
+
     /// Common helper for cursor movement: flush romaji, clear live conversion, set new position
     fn move_caret(&mut self, new_pos: usize) -> EngineResult {
         if !self.converters.romaji.buffer().is_empty() {
@@ -28,10 +40,7 @@ impl InputMethodEngine {
                 return result;
             }
 
-            let preedit = self.set_composing_state();
-            return EngineResult::consumed()
-                .with_action(EngineAction::UpdatePreedit(preedit))
-                .with_action(EngineAction::UpdateAuxText(self.format_aux_composing()));
+            return self.show_raw_composing_after_edit();
         }
 
         // Remove character before cursor from composed_hiragana
@@ -46,7 +55,7 @@ impl InputMethodEngine {
             return result;
         }
 
-        self.refresh_input_state()
+        self.show_raw_composing_after_edit()
     }
 
     /// Move caret left within hiragana input
@@ -78,7 +87,7 @@ impl InputMethodEngine {
             return result;
         }
 
-        self.refresh_input_state()
+        self.show_raw_composing_after_edit()
     }
 
     /// Move caret to start of input
