@@ -52,23 +52,22 @@ if(Fcitx5Core_VERSION VERSION_GREATER_EQUAL "5.1.9")
     target_compile_definitions(karukan PRIVATE FCITX5_HAS_CANDIDATE_SET_COMMENT)
 endif()
 
-set(KARUKAN_RUST_LINK_LIB "${KARUKAN_RUST_LIB}")
+set(KARUKAN_LINK_LIBS
+    Fcitx5::Core
+    Fcitx5::Config
+    ${KARUKAN_RUST_LIB}
+    ${XKBCommon_LIBRARIES}
+)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # Keep the Rust cdylib in DT_NEEDED so $ORIGIN can resolve FFI symbols.
-    set(KARUKAN_RUST_LINK_LIB
+    # Keep runtime libraries in DT_NEEDED so dlopen resolves addon dependencies.
+    set(KARUKAN_LINK_LIBS
         "-Wl,--no-as-needed"
-        "${KARUKAN_RUST_LIB}"
-        "-Wl,--as-needed"
+        ${KARUKAN_LINK_LIBS}
     )
     target_link_options(karukan PRIVATE "LINKER:-z,defs")
 endif()
 
-target_link_libraries(karukan
-    Fcitx5::Core
-    Fcitx5::Config
-    ${KARUKAN_RUST_LINK_LIB}
-    ${XKBCommon_LIBRARIES}
-)
+target_link_libraries(karukan ${KARUKAN_LINK_LIBS})
 
 # Remove lib prefix (fcitx5 expects "karukan.so" not "libkarukan.so")
 set_target_properties(karukan PROPERTIES PREFIX "")
