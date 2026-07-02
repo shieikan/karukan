@@ -62,6 +62,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Keep runtime libraries in DT_NEEDED so dlopen resolves addon dependencies.
     set(KARUKAN_LINK_LIBS
         "-Wl,--no-as-needed"
+        "-lFcitx5Core"
         ${KARUKAN_LINK_LIBS}
     )
     target_link_options(karukan PRIVATE "LINKER:-z,defs")
