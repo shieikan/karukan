@@ -490,6 +490,7 @@ impl InputMethodEngine {
                 self.live.text.clear();
                 self.state = InputState::Empty;
                 self.surrounding_context = None;
+                self.mode.exit_temporary();
                 text
             }
             InputState::Conversion { .. } => {
@@ -503,6 +504,7 @@ impl InputMethodEngine {
                 self.input_buf.clear();
                 self.state = InputState::Empty;
                 self.surrounding_context = None;
+                self.mode.exit_temporary();
                 text
             }
         }

@@ -39,7 +39,10 @@ impl InputMethodEngine {
             && (self.mode.current() != InputMode::Alphabet
                 || karukan_engine::contains_kana(&self.input_buf.text));
         let defer_live_candidates = self.live.enabled
-            && matches!(self.mode.current(), InputMode::Hiragana | InputMode::Alphabet);
+            && matches!(
+                self.mode.current(),
+                InputMode::Hiragana | InputMode::Alphabet
+            );
         if self.live.enabled
             && self.mode.current() == InputMode::Hiragana
             && self.input_buf.text.chars().count() < LIVE_CONVERSION_MIN_READING_CHARS
@@ -207,10 +210,15 @@ impl InputMethodEngine {
             let is_shift_alpha =
                 ch.is_ascii_uppercase() || (shift_active && ch.is_ascii_alphabetic());
 
-            if is_shift_alpha {
-                // Shift-alphabet is a temporary per-word mode, not a sticky
-                // toggle: ModeState remembers the mode to restore when this
-                // word is committed, so the next word returns to kana (#37).
+            // Shift-alphabet is a temporary per-word mode, not a sticky
+            // toggle: ModeState remembers the mode to restore when this
+            // word is committed, so the next word returns to kana (#37).
+            // Emoji is excluded: a `:shortcode` query is its own temporary
+            // session, and switching to Alphabet here would end it and
+            // swallow the shift-typed char as plain ASCII instead.
+            if is_shift_alpha
+                && !matches!(self.mode.current(), InputMode::Alphabet | InputMode::Emoji)
+            {
                 self.mode.enter_temporary(InputMode::Alphabet);
             }
             let ch = if self.mode.current() == InputMode::Alphabet && is_shift_alpha {
@@ -326,7 +334,12 @@ impl InputMethodEngine {
                     let is_shift_alpha =
                         ch.is_ascii_uppercase() || (shift_active && ch.is_ascii_alphabetic());
 
-                    if is_shift_alpha && self.mode.current() != InputMode::Alphabet {
+                    // Emoji is excluded for the same reason as in
+                    // `process_key_empty`: a `:shortcode` query is its own
+                    // temporary session and must survive Shift+letter.
+                    if is_shift_alpha
+                        && !matches!(self.mode.current(), InputMode::Alphabet | InputMode::Emoji)
+                    {
                         // Bake katakana before switching so preedit doesn't revert
                         if self.mode.current() == InputMode::Katakana {
                             self.bake_katakana();

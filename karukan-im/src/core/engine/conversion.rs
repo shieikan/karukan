@@ -847,8 +847,9 @@ impl InputMethodEngine {
         }
 
         // Commit immediately after digit selection
-
         self.state = InputState::Empty;
+        self.input_buf.clear();
+        self.mode.exit_temporary();
 
         EngineResult::consumed()
             .with_action(EngineAction::HideCandidates)

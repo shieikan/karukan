@@ -16,7 +16,7 @@ fn test_mode_toggle_key_switches_alphabet_to_hiragana() {
     assert!(result.consumed);
     assert!(engine.mode.current() != InputMode::Alphabet);
 
-    // Clear the composed "A", then type 'a' → should be 'あ' (hiragana mode)
+    // Commit the existing "A", then type 'a' → should be 'あ' (hiragana mode)
     engine.process_key(&press_key(Keysym::RETURN));
     engine.process_key(&press('a'));
     assert_eq!(engine.preedit().unwrap().text(), "あ");
