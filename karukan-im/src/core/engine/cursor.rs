@@ -35,7 +35,17 @@ impl InputMethodEngine {
     pub(super) fn backspace_composing(&mut self) -> EngineResult {
         // If romaji buffer is not empty, backspace from buffer (not from composed text)
         if !self.converters.romaji.buffer().is_empty() {
+            let previous_output_len = self.converters.romaji.output().chars().count();
             self.converters.romaji.backspace();
+            let current_output_len = self.converters.romaji.output().chars().count();
+
+            // Restoring a converter snapshot can move provisional ASCII
+            // output back into the romaji buffer. Remove the same suffix
+            // from the composed text so display and converter stay aligned.
+            for _ in 0..previous_output_len.saturating_sub(current_output_len) {
+                self.input_buf.remove_char_before_cursor();
+            }
+
             if let Some(result) = self.try_reset_if_empty() {
                 return result;
             }

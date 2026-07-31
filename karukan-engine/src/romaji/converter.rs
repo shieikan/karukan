@@ -29,6 +29,9 @@ pub struct RomajiConverter {
     trie: TrieNode,
     buffer: String,
     output: String,
+    /// Converter snapshots since the last stable conversion boundary.
+    /// Each entry stores the previous buffer, output byte length, and key.
+    history: Vec<(String, usize, char)>,
 }
 
 impl RomajiConverter {
@@ -38,6 +41,7 @@ impl RomajiConverter {
             trie: build_rules(),
             buffer: String::new(),
             output: String::new(),
+            history: Vec::new(),
         }
     }
 
@@ -46,11 +50,24 @@ impl RomajiConverter {
         // Handle uppercase by converting to lowercase
         let ch = ch.to_ascii_lowercase();
 
-        // Add to buffer
-        self.buffer.push(ch);
+        // Preserve the exact converter state before this key. If a later
+        // invalid sequence passes a consonant through to output, Backspace
+        // can restore this snapshot instead of leaving that consonant fixed.
+        self.history
+            .push((self.buffer.clone(), self.output.len(), ch));
 
-        // Try to convert
-        self.try_convert()
+        // Add to buffer and try to convert
+        self.buffer.push(ch);
+        let event = self.try_convert();
+
+        // Once no romaji is pending, character-level editing is handled by
+        // the IME's composed buffer, so snapshots before this boundary are
+        // no longer needed.
+        if self.buffer.is_empty() {
+            self.history.clear();
+        }
+
+        event
     }
 
     /// Convert with the given hiragana and recursively process any remaining buffer.
@@ -213,17 +230,29 @@ impl RomajiConverter {
             }
         }
 
+        self.history.clear();
         result
     }
 
     /// Handle backspace
     pub fn backspace(&mut self) -> BackspaceResult {
-        if let Some(ch) = self.buffer.pop() {
-            BackspaceResult::RemovedBuffer(ch)
-        } else if let Some(ch) = self.output.pop() {
-            BackspaceResult::RemovedOutput(ch)
+        if !self.buffer.is_empty() {
+            if let Some((buffer, output_len, ch)) = self.history.pop() {
+                self.buffer = buffer;
+                self.output.truncate(output_len);
+                BackspaceResult::RemovedBuffer(ch)
+            } else if let Some(ch) = self.buffer.pop() {
+                BackspaceResult::RemovedBuffer(ch)
+            } else {
+                BackspaceResult::Empty
+            }
         } else {
-            BackspaceResult::Empty
+            self.history.clear();
+            if let Some(ch) = self.output.pop() {
+                BackspaceResult::RemovedOutput(ch)
+            } else {
+                BackspaceResult::Empty
+            }
         }
     }
 
@@ -241,6 +270,7 @@ impl RomajiConverter {
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.output.clear();
+        self.history.clear();
     }
 }
 
@@ -366,6 +396,23 @@ mod tests {
 
         let result = conv.backspace();
         assert_eq!(result, BackspaceResult::RemovedOutput('か'));
+    }
+
+    #[test]
+    fn test_backspace_restores_state_before_invalid_romaji() {
+        let mut conv = RomajiConverter::new();
+        conv.push('d');
+        conv.push('s');
+        assert_eq!(conv.output(), "d");
+        assert_eq!(conv.buffer(), "s");
+
+        assert_eq!(conv.backspace(), BackspaceResult::RemovedBuffer('s'));
+        assert_eq!(conv.output(), "");
+        assert_eq!(conv.buffer(), "d");
+
+        conv.push('a');
+        assert_eq!(conv.output(), "だ");
+        assert_eq!(conv.buffer(), "");
     }
 
     #[test]
