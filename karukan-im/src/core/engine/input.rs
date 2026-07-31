@@ -141,11 +141,11 @@ impl InputMethodEngine {
 
     /// Process key in empty state
     pub(super) fn process_key_empty(&mut self, key: &KeyEvent, shift_active: bool) -> EngineResult {
-        // Ctrl+Space: start input with full-width space
+        // Ctrl+Space: start input with a half-width ASCII space
         if key.modifiers.control_key && key.keysym == Keysym::SPACE {
             self.converters.romaji.reset();
             self.input_buf.clear();
-            self.input_buf.insert("\u{3000}");
+            self.input_buf.insert(" ");
             let preedit = self.set_composing_state();
             return EngineResult::consumed()
                 .with_action(EngineAction::UpdatePreedit(preedit))
@@ -154,22 +154,22 @@ impl InputMethodEngine {
 
         // Bare Space from Empty state:
         //
-        // * Hiragana mode → commit a full-width `　` directly, matching
-        //   the Japanese-IME convention. We deliberately do NOT enter
-        //   Composing here: if we did, the next Space the user typed
-        //   would be interpreted by `process_key_composing` as the
-        //   conversion trigger and an unwanted candidate window would
-        //   appear after two spaces in a row.
-        // * Any other mode → return `not_consumed` so the OS delivers
-        //   a normal half-width ASCII space to the application. The
-        //   user is either typing ASCII (Alphabet) or in an edge mode
-        //   (Katakana / Emoji) where injecting `　` would be wrong.
+        // * Hiragana mode → commit a half-width ASCII space directly. We
+        //   deliberately do NOT enter Composing here: if we did, the next
+        //   Space the user typed would be interpreted by
+        //   `process_key_composing` as the conversion trigger and an
+        //   unwanted candidate window would appear after two spaces in a
+        //   row.
+        // * Any other mode → return `not_consumed` so the OS delivers its
+        //   own half-width ASCII space to the application. The user is
+        //   either typing ASCII (Alphabet) or in an edge mode (Katakana /
+        //   Emoji) where consuming the key would be wrong.
         //
-        // The full-width space gesture from Empty in any mode is
-        // `Ctrl+Space` (above), which seeds a Composing session.
+        // `Ctrl+Space` (above) also inserts a half-width ASCII space, but
+        // seeds a Composing session with it instead of committing.
         if key.keysym == Keysym::SPACE && !key.modifiers.control_key && !key.modifiers.alt_key {
             return if self.mode.current() == InputMode::Hiragana {
-                EngineResult::consumed().with_action(EngineAction::Commit("\u{3000}".to_string()))
+                EngineResult::consumed().with_action(EngineAction::Commit(" ".to_string()))
             } else {
                 EngineResult::not_consumed()
             };
@@ -266,9 +266,13 @@ impl InputMethodEngine {
             .with_action(EngineAction::UpdateAuxText(self.format_aux_composing()))
     }
 
-    /// Insert a full-width space (U+3000) at cursor position
-    pub(super) fn input_fullwidth_space(&mut self) -> EngineResult {
-        self.input_buf.insert("\u{3000}");
+    /// Insert a half-width ASCII space at the cursor position.
+    pub(super) fn input_halfwidth_space(&mut self) -> EngineResult {
+        if !self.converters.romaji.buffer().is_empty() {
+            self.flush_romaji_to_composed();
+            self.converters.romaji.reset();
+        }
+        self.input_buf.insert(" ");
         self.refresh_input_state()
     }
 
@@ -281,8 +285,8 @@ impl InputMethodEngine {
         // Handle Ctrl+key shortcuts
         if key.modifiers.control_key {
             match key.keysym {
-                // Ctrl+Space: insert full-width space (U+3000)
-                Keysym::SPACE => return self.input_fullwidth_space(),
+                // Ctrl+Space: insert a half-width ASCII space
+                Keysym::SPACE => return self.input_halfwidth_space(),
                 // Ctrl+K: enter katakana mode
                 Keysym::KEY_K | Keysym::KEY_K_UPPER => return self.enter_katakana_mode(),
                 // Ctrl+A: move to beginning (Emacs-style Home)
