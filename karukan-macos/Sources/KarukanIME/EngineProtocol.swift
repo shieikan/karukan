@@ -9,7 +9,6 @@ struct KeyResult: Decodable {
     let actions: [EngineAction]
     let conversionMs: UInt64?
     let processKeyMs: UInt64?
-    let pendingAsync: Bool?
 }
 
 struct PreeditAttr: Decodable {

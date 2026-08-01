@@ -10,7 +10,6 @@
 //! |------------------------|------------------------------------------|-------------------|
 //! | `init`                 | `{}`                                     | [`InitResult`]    |
 //! | `process_key`          | [`ProcessKeyParams`]                     | [`KeyResult`]     |
-//! | `poll_async_conversion`| `{}`                                     | [`KeyResult`]     |
 //! | `select_candidate`     | [`SelectCandidateParams`]                | [`KeyResult`]     |
 //! | `commit`               | `{}`                                     | [`KeyResult`]     |
 //! | `reset`                | `{}`                                     | `{}`              |
@@ -141,9 +140,6 @@ pub struct KeyResult {
     pub conversion_ms: u64,
     /// End-to-end engine processing time for this request in milliseconds.
     pub process_key_ms: u64,
-    /// Whether the server still has initialization or conversion work that
-    /// can be collected by a later `poll_async_conversion` request.
-    pub pending_async: bool,
 }
 
 #[derive(Debug, Serialize)]

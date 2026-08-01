@@ -2,17 +2,11 @@ use serde_json::{Value, json};
 
 use super::ImServer;
 use crate::config::Settings;
-use crate::core::candidate::{Candidate, CandidateList};
-use crate::core::engine::EngineAction;
 use crate::core::keycode::Keysym;
 
 // XKB keysyms for common keys (u32 aliases for the JSON payloads below)
 const XKB_KEY_K: u32 = Keysym::KEY_K.0;
 const XKB_KEY_A: u32 = Keysym::KEY_A.0;
-const XKB_KEY_E: u32 = Keysym::KEY_E.0;
-const XKB_KEY_N: u32 = Keysym::KEY_N.0;
-const XKB_KEY_1: u32 = Keysym::KEY_1.0;
-const XKB_KEY_0: u32 = Keysym::KEY_0.0;
 const XKB_KEY_LOWER_L: u32 = Keysym::KEY_L.0;
 const XKB_KEY_RETURN: u32 = Keysym::RETURN.0;
 const XKB_KEY_ESCAPE: u32 = Keysym::ESCAPE.0;
@@ -117,6 +111,7 @@ fn test_typing_and_commit() {
     let resp = press(&mut server, XKB_KEY_RETURN);
     let commits = actions_of(&resp, "commit");
     assert_eq!(commits.last().unwrap()["text"], "か");
+    assert!(actions_of(&resp, "update_preedit").is_empty());
 }
 
 #[test]
@@ -146,6 +141,7 @@ fn test_explicit_commit_method() {
     );
     let commits = actions_of(&resp, "commit");
     assert_eq!(commits.last().unwrap()["text"], "か");
+    assert!(actions_of(&resp, "update_preedit").is_empty());
 
     // Nothing left to commit afterwards
     let resp = request(
@@ -153,6 +149,10 @@ fn test_explicit_commit_method() {
         json!({"jsonrpc":"2.0","id":8,"method":"commit"}),
     );
     assert!(actions_of(&resp, "commit").is_empty());
+    assert_eq!(
+        actions_of(&resp, "update_preedit").last().unwrap()["text"],
+        ""
+    );
 }
 
 #[test]
@@ -174,6 +174,7 @@ fn test_select_candidate_commits_page_candidate() {
     assert_eq!(resp["result"]["consumed"], true);
     let commits = actions_of(&resp, "commit");
     assert_eq!(commits.last().unwrap()["text"], first_text);
+    assert!(actions_of(&resp, "update_preedit").is_empty());
     assert!(!actions_of(&resp, "hide_candidates").is_empty());
 
     let resp = request(
@@ -240,91 +241,4 @@ fn test_status_before_init() {
     );
     assert_eq!(resp["result"]["initialized"], false);
     assert_eq!(resp["result"]["state"], "empty");
-}
-
-#[test]
-fn poll_async_conversion_returns_without_a_subsequent_key() {
-    let mut server = test_server();
-    press(&mut server, XKB_KEY_A);
-
-    let resp = request(
-        &mut server,
-        json!({"jsonrpc":"2.0","id":30,"method":"poll_async_conversion"}),
-    );
-    assert!(resp["error"].is_null());
-    assert_eq!(resp["result"]["consumed"], false);
-    assert!(resp["result"]["actions"].is_array());
-    assert!(resp["result"]["pending_async"].is_boolean());
-
-    let status = request(
-        &mut server,
-        json!({"jsonrpc":"2.0","id":31,"method":"status"}),
-    );
-    assert_eq!(status["result"]["state"], "composing");
-}
-
-#[test]
-fn candidate_page_size_is_nine_for_multi_page_counter_results() {
-    let candidates = (0..20)
-        .map(|index| {
-            let mut candidate = Candidate::with_reading(format!("10件-{index:02}"), "10けん");
-            candidate.source_label = Some("🔄 変換".to_string());
-            candidate.description = Some("件".to_string());
-            candidate
-        })
-        .collect();
-    let mut list = CandidateList::new(candidates);
-
-    let first_page =
-        serde_json::to_value(super::to_action(EngineAction::ShowCandidates(list.clone()))).unwrap();
-    assert_eq!(first_page["type"], "show_candidates");
-    assert_eq!(first_page["candidates"].as_array().unwrap().len(), 9);
-    assert_eq!(first_page["page"], 0);
-    assert_eq!(first_page["total_pages"], 3);
-    assert_eq!(first_page["candidates"][0]["text"], "10件-00");
-    assert_eq!(first_page["candidates"][0]["description"], "件");
-
-    list.select(9);
-    let second_page =
-        serde_json::to_value(super::to_action(EngineAction::ShowCandidates(list))).unwrap();
-    assert_eq!(second_page["candidates"].as_array().unwrap().len(), 9);
-    assert_eq!(second_page["cursor"], 0);
-    assert_eq!(second_page["page"], 1);
-    assert_eq!(second_page["total_pages"], 3);
-    assert_eq!(second_page["candidates"][0]["text"], "10件-09");
-}
-
-#[test]
-fn homonymous_counter_first_page_serialization_preserves_order() {
-    let mut server = test_server();
-    for keysym in [
-        XKB_KEY_1, XKB_KEY_0, XKB_KEY_K, XKB_KEY_E, XKB_KEY_N, XKB_KEY_N,
-    ] {
-        press(&mut server, keysym);
-    }
-
-    let resp = press(&mut server, XKB_KEY_SPACE);
-    let shows = actions_of(&resp, "show_candidates");
-    let show = shows
-        .last()
-        .expect("real Space must show engine candidates");
-    let candidates = show["candidates"].as_array().expect("candidate page");
-    let texts: Vec<&str> = candidates
-        .iter()
-        .filter_map(|candidate| candidate["text"].as_str())
-        .collect();
-    let preferred_index = texts.iter().position(|text| *text == "10件");
-    let alternate_index = texts.iter().position(|text| *text == "10軒");
-    assert!(
-        preferred_index.is_some(),
-        "real engine output must contain 10件: {texts:?}"
-    );
-    assert!(
-        alternate_index.is_some(),
-        "real engine output must contain 10軒: {texts:?}"
-    );
-    assert!(preferred_index < alternate_index);
-    assert_eq!(show["cursor"], 0);
-    assert_eq!(show["page"], 0);
-    assert_eq!(show["total_pages"], 1);
 }

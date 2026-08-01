@@ -1,51 +1,52 @@
-<div align="center">
-  <img src="icon.png" width="128" alt="karukan" />
-  <h1>Karukan</h1>
-  <p>Linux・macOS向け日本語入力システム — ニューラルかな漢字変換エンジン</p>
+# Karukan
 
-  [![CI (engine)](https://github.com/togatoga/karukan/actions/workflows/karukan-engine-ci.yml/badge.svg)](https://github.com/togatoga/karukan/actions/workflows/karukan-engine-ci.yml)
-  [![CI (im)](https://github.com/togatoga/karukan/actions/workflows/karukan-im-ci.yml/badge.svg)](https://github.com/togatoga/karukan/actions/workflows/karukan-im-ci.yml)
-  [![CI (fcitx5)](https://github.com/togatoga/karukan/actions/workflows/karukan-fcitx5-ci.yml/badge.svg)](https://github.com/togatoga/karukan/actions/workflows/karukan-fcitx5-ci.yml)
-  [![CI (macos)](https://github.com/togatoga/karukan/actions/workflows/karukan-macos-ci.yml/badge.svg)](https://github.com/togatoga/karukan/actions/workflows/karukan-macos-ci.yml)
-  [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-</div>
+Karukan は、Linux / macOS 向けの日本語入力システムです。
+この README では、macOS で使うための導入手順と、この版での主な改善点だけをまとめます。
 
-<div align="center">
-  <img src="images/demo.gif" width="800" alt="karukan demo" />
-</div>
+## 導入方法
 
-## プロジェクト構成
+### 必要なもの
 
-| クレート | 説明 |
-|---------|------|
-| [karukan-fcitx5](karukan-fcitx5/) | Linux向けIMEフロントエンド — fcitx5アドオン + C FFI |
-| [karukan-macos](karukan-macos/) | macOS向けIMEフロントエンド — Swift/InputMethodKit |
-| [karukan-im](karukan-im/) | 共有IMEエンジン — ステートマシン、ローマ字変換、karukan-imserver(macOS向けJSON-RPCサーバー) |
-| [karukan-engine](karukan-engine/) | コアライブラリ — ローマ字→ひらがな変換 + llama.cppによるニューラルかな漢字変換 |
-| [karukan-cli](karukan-cli/) | CLIツール・サーバー — 辞書ビルド、Sudachi辞書生成、辞書ビューア、AJIMEE-Bench、HTTPサーバー |
+- macOS
+- Xcode または Command Line Tools
+- Rust toolchain
+- `git` / `make`
 
-## 特徴
+### インストール
 
-- **ニューラルかな漢字変換**: GPT-2ベースのモデルをllama.cppで推論し、高度な日本語変換
-- **ライブ変換**: 入力と同時に変換結果をリアルタイム表示。Spaceを押さずに変換が進む（`Ctrl+Shift+L` でON/OFF）
-- **コンテキスト対応**: 周辺テキストを考慮した日本語変換
-- **変換学習**: ユーザーが選択した変換結果を記憶し、次回以降の変換で優先表示。予測変換（前方一致）にも対応し、入力途中でも学習済みの候補を提示
-- **システム辞書**: [SudachiDict](https://github.com/WorksApplications/SudachiDict)の辞書データからシステム辞書を構築
-- **候補リライター (Mozcから移植)**: 半角カタカナ、英字の大文字小文字・全角半角、記号の関連候補、数字の各種表記（漢数字・大字・ローマ数字・丸数字・16/8/2進数）を自動生成。各候補にはMozc由来の注釈（「半角カタカナ」「16進数」など）が付く
-- **絵文字入力**: かな読み（`ぴえん` → 🥺、`きんにく` → 💪）と Slack 風 `:trigger` クエリ（`:smile` → 😄、`:halo` → 😇）の両方をサポート
+```bash
+git clone <このリポジトリのURL>
+cd karukan/karukan-macos
+make install
+```
 
-> **Note:** 初回起動時にHugging Faceからモデルをダウンロードするため、初回の変換開始までに時間がかかります。2回目以降はダウンロード済みのモデルが使用されます。
+初回は変換モデルと辞書をダウンロードするため、少し時間がかかります。
 
-## インストール
+インストール後は、次の手順で Karukan を入力ソースに追加します。
 
-- **Linux (fcitx5)**: [karukan-fcitx5 の README](karukan-fcitx5/README.md#install) を参照
-- **macOS**: [karukan-macos の README](karukan-macos/README.md) を参照
+1. macOS からログアウトして、再ログインする
+2. システム設定 → キーボード → 入力ソース → 編集 → `+`
+3. 日本語 → Karukan を追加する
+4. メニューバーの入力メニューから Karukan を選ぶ
 
-## ライセンス
+### 更新
 
-MIT OR Apache-2.0 のデュアルライセンスで提供しています。
+すでに導入済みの場合は、次のコマンドで更新できます。
 
-- [MIT License](LICENSE-MIT)
-- [Apache License 2.0](LICENSE-APACHE)
+```bash
+cd karukan-macos
+make install
+killall KarukanIME || true
+```
 
-[karukan-engine/data/](karukan-engine/data/) 配下には [Mozc](https://github.com/google/mozc)（Google製日本語入力システム）から派生したデータを含み、こちらは [BSD 3-Clause License](http://opensource.org/licenses/BSD-3-Clause) のもとで配布されています。各派生ファイルの由来およびMozcの著作権表記は [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) を参照してください。
+次にテキスト入力欄へフォーカスしたときに、Karukan が再起動します。
+
+## この版での主な改善点
+
+- ライブ変換は残したまま、入力中に候補ウィンドウが毎回開かないようにしています。
+- 候補は Space を押したときに表示されます。
+- 1〜2 文字程度の短い読みでは、過剰な自動変換を抑えて、ひらがなのまま表示します。
+- Backspace / Delete で削除している間は、変換後の文字ではなく読みを表示するため、どこまで消したか分かりやすくなっています。
+- `:smile` のような絵文字入力は、ライブ変換が有効でも候補が表示されます。
+
+詳しい設定や開発用の説明は、各サブディレクトリの README を参照してください。

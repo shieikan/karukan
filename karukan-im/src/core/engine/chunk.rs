@@ -107,14 +107,7 @@ struct ChunkPlan {
 impl ChunkPlan {
     /// Diff `old_text` (the concatenated readings of the previous chunks,
     /// whose individual char lengths are `old_lens`) against the new `text`.
-    fn compute(
-        old_lens: &[usize],
-        old_fresh: &[bool],
-        old_text: &[char],
-        text: &[char],
-        chunk_len: usize,
-    ) -> Self {
-        debug_assert_eq!(old_lens.len(), old_fresh.len());
+    fn compute(old_lens: &[usize], old_text: &[char], text: &[char], chunk_len: usize) -> Self {
         let cp = common_prefix_len(old_text, text);
         let cs = common_suffix_len(old_text, text, cp);
 
@@ -135,7 +128,6 @@ impl ChunkPlan {
             && lead_chars == cp
             && cp < text.len()
             && old_lens[lead_count - 1] < chunk_len
-            && !old_fresh[lead_count - 1]
             && same_group(old_text[lead_chars - 1], text[cp])
         {
             lead_count -= 1;
@@ -166,15 +158,17 @@ impl ChunkPlan {
 }
 
 impl InputMethodEngine {
-    /// Prepare the composing buffer for an async auto-suggest request.
+    /// Auto-suggest over the composing buffer, split into chunks of at most
+    /// `config.composing_chunk_len` reading characters so each model call
+    /// stays bounded for long input.
     ///
     /// Re-chunking is *incremental* and content-anchored: the new buffer is
     /// diffed against the previous chunking (`self.chunks`) by common
     /// character prefix/suffix. Chunks that fall entirely in the unchanged
     /// prefix are reused as-is, chunks entirely in the unchanged suffix keep
     /// their cached conversion, and only the changed middle span is re-chunked
-    /// and proposed model conversions are computed by the worker. So a keystroke
-    /// at the end reconverts only the final chunk, and an edit/deletion in the middle reconverts only the
+    /// and re-run through the model. So a keystroke at the end reconverts only
+    /// the final chunk, and an edit/deletion in the middle reconverts only the
     /// chunk(s) it touched — not everything downstream.
     ///
     /// Trade-off: a middle edit changes the left context of the chunks to its
@@ -184,25 +178,31 @@ impl InputMethodEngine {
     /// left context is still the editor surrounding text plus the converted text
     /// of all preceding chunks, truncated to `max_api_context_len`.
     ///
-    /// Changed chunks use the raw reading until a matching worker proposal is
-    /// atomically committed by the engine.
+    /// Returns the concatenated conversion of the whole buffer, or `None` when
+    /// it equals the raw reading (no useful model suggestion).
+    ///
+    /// Note: for input no longer than one chunk (the common case, default
+    /// N=30) this produces exactly one model call over the whole buffer, i.e.
+    /// identical behavior to a whole-buffer conversion.
     pub(super) fn chunked_auto_suggest(&mut self) -> Option<String> {
         let full_reading = self.input_buf.text.clone();
         if full_reading.is_empty() {
             self.chunks.clear();
             return None;
         }
+        self.ensure_kanji_converter();
+
         let chunk_len = self.chunk_len();
         let text: Vec<char> = full_reading.chars().collect();
+        let base_ctx = self.truncate_context_for_api();
 
         // Previous chunking (covers the pre-edit text). Move it out so the
         // model calls below don't conflict with borrowing `self.chunks`.
         let mut old = std::mem::take(&mut self.chunks);
         let old_lens: Vec<usize> = old.iter().map(|s| s.reading.chars().count()).collect();
-        let old_fresh: Vec<bool> = old.iter().map(|s| s.fresh).collect();
         let old_text: Vec<char> = old.iter().flat_map(|s| s.reading.chars()).collect();
 
-        let plan = ChunkPlan::compute(&old_lens, &old_fresh, &old_text, &text, chunk_len);
+        let plan = ChunkPlan::compute(&old_lens, &old_text, &text, chunk_len);
 
         let mut chunks: Vec<ComposingChunk> = Vec::with_capacity(old.len() + 1);
         let mut combined = String::new();
@@ -217,17 +217,12 @@ impl InputMethodEngine {
         // chunks to keep are its last `trail_count` entries.
         let trail_start = old.len() - plan.trail_count;
 
-        // 2. Changed middle span: re-chunk with raw fallback values. The worker
-        //    receives this full cache and proposes model replacements.
+        // 2. Changed middle span: re-chunk and reconvert each new chunk against
+        //    everything converted so far.
         let middle = &text[plan.mid_start..plan.mid_end];
         for chunk in group_chunks(middle, chunk_len) {
             let reading: String = chunk.iter().collect();
-            let new = ComposingChunk {
-                position: 0,
-                reading: reading.clone(),
-                converted: reading,
-                fresh: false,
-            };
+            let new = self.convert_new_chunk(reading, &base_ctx, &combined);
             combined.push_str(&new.converted);
             chunks.push(new);
         }
@@ -239,11 +234,6 @@ impl InputMethodEngine {
             chunks.push(chunk);
         }
 
-        let mut position = 0;
-        for chunk in &mut chunks {
-            chunk.position = position;
-            position += chunk.reading.chars().count();
-        }
         let reconverted = chunks.len() - plan.lead_count - plan.trail_count;
         self.chunks = chunks;
         self.log_chunk_state("convert");
@@ -253,6 +243,27 @@ impl InputMethodEngine {
         );
 
         (combined != full_reading).then_some(combined)
+    }
+
+    /// Build one freshly-converted chunk for `reading`, whose left context is
+    /// `base_ctx` plus everything converted so far (`combined`). A non-Japanese
+    /// reading (digits / symbols / alphabet) is passed through verbatim — never
+    /// sent to the model, which tends to drop digits mid-run; a Japanese
+    /// reading is converted with that left context. The reading is
+    /// group-homogeneous, so its first char decides. See [`is_japanese`].
+    fn convert_new_chunk(
+        &mut self,
+        reading: String,
+        base_ctx: &str,
+        combined: &str,
+    ) -> ComposingChunk {
+        let converted = if reading.chars().next().is_some_and(is_japanese) {
+            let lctx = self.lctx_for(base_ctx, combined);
+            self.convert_chunk(&reading, &lctx)
+        } else {
+            reading.clone()
+        };
+        ComposingChunk { reading, converted }
     }
 
     /// Configured maximum chunk length in chars, clamped to at least 1.
@@ -282,22 +293,26 @@ impl InputMethodEngine {
         self.lctx_for(&base, &preceding)
     }
 
-    /// Export the exact handler-produced chunk plan to the worker. The worker
-    /// receives positions, duplicate readings, group boundaries, and contexts
-    /// as data; it never reconstructs or re-groups this plan.
-    pub(super) fn chunk_requests(&self) -> Vec<super::async_conversion::ChunkRequest> {
-        self.chunks
-            .iter()
-            .enumerate()
-            .map(|(index, chunk)| super::async_conversion::ChunkRequest {
-                position: chunk.position,
-                reading: chunk.reading.clone(),
-                context: self.chunk_lctx(index),
-                converted: chunk.converted.clone(),
-                should_convert: chunk.reading.chars().next().is_some_and(is_japanese)
-                    && !chunk.fresh,
-            })
-            .collect()
+    /// Best-effort lazy init of the kanji converter. Chunking proceeds even
+    /// on failure so `self.chunks` always mirrors the current buffer (which
+    /// chunk the cursor is in, etc.); `run_kana_kanji_conversion` handles a
+    /// missing converter by yielding nothing, and each chunk falls back to its
+    /// own reading.
+    fn ensure_kanji_converter(&mut self) {
+        if self.converters.kanji.is_none()
+            && let Err(e) = self.init_kanji_converter()
+        {
+            debug!("Failed to initialize kanji converter: {}", e);
+        }
+    }
+
+    /// Model conversion of one chunk's `reading` given `lctx`, falling back to
+    /// the reading itself when the model yields nothing.
+    fn convert_chunk(&mut self, reading: &str, lctx: &str) -> String {
+        self.run_kana_kanji_conversion(reading, lctx, 1)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| reading.to_string())
     }
 
     /// Index of the chunk the cursor currently sits in, found by walking the
@@ -432,22 +447,7 @@ mod plan_tests {
             old_lens.iter().sum::<usize>(),
             "old_lens vs old_text"
         );
-        let old_fresh = vec![false; old_lens.len()];
-        ChunkPlan::compute(old_lens, &old_fresh, &old, &new, chunk_len)
-    }
-
-    fn plan_with_fresh(
-        old_lens: &[usize],
-        old_fresh: &[bool],
-        old_text: &str,
-        new_text: &str,
-        chunk_len: usize,
-    ) -> ChunkPlan {
-        let old: Vec<char> = old_text.chars().collect();
-        let new: Vec<char> = new_text.chars().collect();
-        assert_eq!(old.len(), old_lens.iter().sum::<usize>());
-        assert_eq!(old_lens.len(), old_fresh.len());
-        ChunkPlan::compute(old_lens, old_fresh, &old, &new, chunk_len)
+        ChunkPlan::compute(old_lens, &old, &new, chunk_len)
     }
 
     #[test]
@@ -490,21 +490,6 @@ mod plan_tests {
                 lead_count: 1,
                 trail_count: 0,
                 mid_start: 2,
-                mid_end: 4
-            }
-        );
-    }
-
-    #[test]
-    fn append_after_fresh_nonfull_chunk_keeps_stable_prefix() {
-        // [ab][c] + "d": a fresh short tail is stable; only the new tail is dirty.
-        let p = plan_with_fresh(&[2, 1], &[true, true], "abc", "abcd", 2);
-        assert_eq!(
-            p,
-            ChunkPlan {
-                lead_count: 2,
-                trail_count: 0,
-                mid_start: 3,
                 mid_end: 4
             }
         );

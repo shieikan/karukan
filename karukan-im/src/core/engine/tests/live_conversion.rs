@@ -3,9 +3,12 @@ use super::*;
 // --- Live conversion tests ---
 
 fn updated_preedit_text(result: &EngineResult) -> Option<String> {
-    result.actions.iter().find_map(|action| match action {
-        EngineAction::UpdatePreedit(preedit) => Some(preedit.text().to_string()),
-        _ => None,
+    result.actions.iter().find_map(|a| {
+        if let EngineAction::UpdatePreedit(p) = a {
+            Some(p.text().to_string())
+        } else {
+            None
+        }
     })
 }
 
@@ -13,14 +16,22 @@ fn has_show_candidates(result: &EngineResult) -> bool {
     result
         .actions
         .iter()
-        .any(|action| matches!(action, EngineAction::ShowCandidates(_)))
+        .any(|a| matches!(a, EngineAction::ShowCandidates(_)))
 }
 
 fn has_hide_candidates(result: &EngineResult) -> bool {
     result
         .actions
         .iter()
-        .any(|action| matches!(action, EngineAction::HideCandidates))
+        .any(|a| matches!(a, EngineAction::HideCandidates))
+}
+
+fn conversion_state_texts(engine: &InputMethodEngine) -> Vec<String> {
+    engine
+        .state()
+        .candidates()
+        .map(|cl| cl.candidates().iter().map(|c| c.text.clone()).collect())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -36,104 +47,162 @@ fn test_live_conversion_enabled() {
 }
 
 #[test]
-fn test_live_conversion_waits_for_three_reading_characters() {
-    let mut engine = make_live_conversion_engine();
-
-    for ch in "kore".chars() {
-        engine.process_key(&press(ch));
-    }
-    assert_eq!(engine.input_buf.text, "これ");
-    assert!(engine.pending_async_request.is_none());
-    assert!(engine.chunks.is_empty());
-
-    for ch in "mo".chars() {
-        engine.process_key(&press(ch));
-    }
-    assert_eq!(engine.input_buf.text, "これも");
-    assert!(engine.pending_async_request.is_some());
-    assert!(!engine.chunks.is_empty());
-}
-
-#[test]
 fn test_live_conversion_suppresses_candidates_until_explicit_conversion() {
     let mut engine = make_live_conversion_engine();
 
     engine.process_key(&press('a'));
     let result = engine.process_key(&press('i'));
-    assert!(!has_show_candidates(&result));
-    assert!(has_hide_candidates(&result));
+
+    assert!(
+        !has_show_candidates(&result),
+        "live conversion should not open the candidate window while composing"
+    );
 
     let result = engine.process_key(&press_key(Keysym::SPACE));
-    assert!(has_show_candidates(&result));
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::ShowCandidates(_))),
+        "explicit Space conversion should still open the candidate window"
+    );
 }
 
 #[test]
-fn test_live_conversion_keeps_reused_chunks_visible_while_tail_is_pending() {
-    let mut engine = InputMethodEngine::with_config(EngineConfig {
-        live_conversion: true,
-        composing_chunk_len: 2,
-        ..EngineConfig::default()
-    });
-    engine.input_buf.insert("あいうえ");
-    engine.chunked_auto_suggest();
-    engine.chunks[0].converted = "愛".to_string();
-    engine.chunks[0].fresh = true;
-    engine.chunks[1].converted = "上".to_string();
-    engine.chunks[1].fresh = true;
+fn test_live_conversion_keeps_converted_preedit_but_hides_candidates_for_long_reading() {
+    let mut engine = make_live_conversion_engine();
+    engine.input_buf.insert("ばあい");
+    engine.chunks = vec![ComposingChunk {
+        reading: "ばあい".to_string(),
+        converted: "場合".to_string(),
+    }];
 
-    engine.input_buf.insert("お");
     let result = engine.refresh_input_state();
 
-    assert_eq!(engine.live.text, "愛上お");
-    assert_eq!(updated_preedit_text(&result).as_deref(), Some("愛上お"));
-    assert!(has_hide_candidates(&result));
+    assert_eq!(engine.live.text, "場合");
+    assert_eq!(updated_preedit_text(&result).as_deref(), Some("場合"));
+    assert!(
+        !has_show_candidates(&result),
+        "live conversion should update preedit without opening candidates"
+    );
+    assert!(
+        has_hide_candidates(&result),
+        "live conversion should explicitly keep the candidate window closed"
+    );
 }
 
 #[test]
-fn test_live_conversion_suppresses_candidates_in_alphabet_mode() {
+fn test_live_conversion_suppresses_symbol_rewriter_until_explicit_conversion() {
     let mut engine = make_live_conversion_engine();
-    engine.process_key(&press('a'));
-    engine.process_key(&press_shift('A'));
+    engine.process_key(&press('.'));
+    engine.process_key(&press('.'));
+    let result = engine.process_key(&press('.'));
 
-    let result = engine.process_key(&press('b'));
-
-    assert!(!has_show_candidates(&result));
+    assert_eq!(engine.input_buf.text, "。。。");
+    assert!(
+        !has_show_candidates(&result),
+        "ordinary symbol suggestions should stay hidden during live conversion"
+    );
     assert!(has_hide_candidates(&result));
+
+    engine.process_key(&press_key(Keysym::SPACE));
+    assert!(
+        conversion_state_texts(&engine).iter().any(|t| t == "…"),
+        "explicit Space conversion should still show symbol rewriter candidates"
+    );
 }
 
 #[test]
-fn test_live_conversion_keeps_emoji_picker_visible() {
+fn test_live_conversion_waits_for_enough_reading_before_showing_conversion() {
     let mut engine = make_live_conversion_engine();
-    engine.process_key(&press(':'));
-    let result = engine.process_key(&press('s'));
+    engine.input_buf.insert("ばあ");
+    engine.chunks = vec![ComposingChunk {
+        reading: "ばあ".to_string(),
+        converted: "婆".to_string(),
+    }];
 
-    assert!(has_show_candidates(&result));
+    let result = engine.refresh_input_state();
+
+    assert!(
+        engine.live.text.is_empty(),
+        "short ambiguous fragments should stay in raw reading form"
+    );
+    assert_eq!(updated_preedit_text(&result).as_deref(), Some("ばあ"));
 }
 
 #[test]
-fn test_live_conversion_backspace_keeps_remaining_reading_raw() {
+fn test_live_conversion_backspace_shows_raw_reading_while_deleting() {
     let mut engine = InputMethodEngine::with_config(EngineConfig {
         live_conversion: true,
         composing_chunk_len: 2,
         ..EngineConfig::default()
     });
     engine.input_buf.insert("ばあい");
-    engine.live.text = "場合".to_string();
-    engine.chunks = vec![ComposingChunk {
-        position: 0,
-        reading: "ばあい".to_string(),
-        converted: "場合".to_string(),
-        fresh: true,
-    }];
+    engine.chunks = vec![
+        ComposingChunk {
+            reading: "ばあ".to_string(),
+            converted: "婆".to_string(),
+        },
+        ComposingChunk {
+            reading: "い".to_string(),
+            converted: "い".to_string(),
+        },
+    ];
+    engine.live.text = "婆い".to_string();
     engine.set_composing_state();
 
     let result = engine.process_key(&press_key(Keysym::BACKSPACE));
 
     assert_eq!(engine.input_buf.text, "ばあ");
     assert!(engine.live.text.is_empty());
-    assert!(engine.chunks.is_empty());
     assert_eq!(updated_preedit_text(&result).as_deref(), Some("ばあ"));
-    assert!(has_hide_candidates(&result));
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::HideCandidates)),
+        "deleting should keep the candidate window closed"
+    );
+}
+
+#[test]
+fn test_live_conversion_delete_shows_raw_reading_while_deleting() {
+    let mut engine = InputMethodEngine::with_config(EngineConfig {
+        live_conversion: true,
+        composing_chunk_len: 1,
+        ..EngineConfig::default()
+    });
+    engine.input_buf.insert("ばあい");
+    engine.input_buf.cursor_pos = 0;
+    engine.chunks = vec![
+        ComposingChunk {
+            reading: "ば".to_string(),
+            converted: "婆".to_string(),
+        },
+        ComposingChunk {
+            reading: "あ".to_string(),
+            converted: "亜".to_string(),
+        },
+        ComposingChunk {
+            reading: "い".to_string(),
+            converted: "意".to_string(),
+        },
+    ];
+    engine.live.text = "婆亜意".to_string();
+    engine.set_composing_state();
+
+    let result = engine.process_key(&press_key(Keysym::DELETE));
+
+    assert_eq!(engine.input_buf.text, "あい");
+    assert!(engine.live.text.is_empty());
+    assert_eq!(updated_preedit_text(&result).as_deref(), Some("あい"));
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::HideCandidates)),
+        "deleting should keep the candidate window closed"
+    );
 }
 
 #[test]
@@ -305,7 +374,7 @@ fn test_alphabet_mode_with_kana_keeps_converting() {
     // "あ" then Shift+letter switches into alphabet mode -> buffer "あA"
     engine.process_key(&press('a'));
     engine.process_key(&press_shift('A'));
-    assert!(engine.input_mode == InputMode::Alphabet);
+    assert!(engine.mode.current() == InputMode::Alphabet);
     assert!(karukan_engine::contains_kana(&engine.input_buf.text));
 
     // Simulate a previous live conversion result lingering on screen.
@@ -332,7 +401,7 @@ fn test_alphabet_mode_pure_latin_preserves_live_text() {
     // Enter alphabet mode with pure latin "Ab".
     engine.process_key(&press_shift('A'));
     engine.process_key(&press('b'));
-    assert!(engine.input_mode == InputMode::Alphabet);
+    assert!(engine.mode.current() == InputMode::Alphabet);
     assert!(!karukan_engine::contains_kana(&engine.input_buf.text));
 
     engine.live.text = "AB".to_string();

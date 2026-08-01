@@ -4,7 +4,6 @@ use lifecycle::*;
 use query::*;
 use std::ffi::CStr;
 use std::ptr;
-use std::time::{Duration, Instant};
 
 // XKB keysyms for common keys
 const XKB_KEY_A: u32 = 0x61;
@@ -53,11 +52,6 @@ impl TestEngine {
     /// Send a key release event. Returns true if consumed.
     fn release(&self, keysym: u32) -> bool {
         karukan_engine_process_key(self.0, keysym, 0, 1) == 1
-    }
-
-    /// Poll completed async UI actions without submitting another key.
-    fn poll_async_conversion(&self) -> bool {
-        karukan_engine_poll_async_conversion(self.0) == 1
     }
 
     /// Get the current preedit text as a &str.
@@ -117,29 +111,6 @@ fn test_engine_lifecycle() {
 }
 
 #[test]
-fn init_queues_without_blocking_and_reports_not_ready_until_completion() {
-    let engine = TestEngine::new();
-    let started = Instant::now();
-
-    assert_eq!(karukan_engine_init(engine.ptr()), 0);
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "first-key initialization must not block the Fcitx5 handler"
-    );
-    assert_eq!(karukan_engine_is_ready(engine.ptr()), 0);
-    // The worker may finish quickly or still be initializing; either state is
-    // valid, but readiness must not be claimed before a successful completion.
-    let _initializing = karukan_engine_is_initializing(engine.ptr());
-
-    let key_started = Instant::now();
-    assert!(engine.press(XKB_KEY_A));
-    assert!(
-        key_started.elapsed() < Duration::from_secs(3),
-        "the first production Fcitx5 key path must stay below three seconds"
-    );
-}
-
-#[test]
 fn test_null_engine_safety() {
     // All functions should handle null safely
     assert_eq!(
@@ -154,28 +125,8 @@ fn test_null_engine_safety() {
     assert_eq!(karukan_engine_has_candidates(ptr::null()), 0);
     assert_eq!(karukan_engine_get_candidate_count(ptr::null()), 0);
     assert_eq!(karukan_engine_get_last_conversion_ms(ptr::null()), 0);
-    assert_eq!(karukan_engine_is_ready(ptr::null()), 0);
-    assert_eq!(karukan_engine_is_initializing(ptr::null()), 0);
-    assert_eq!(karukan_engine_has_pending_async_conversion(ptr::null()), 0);
-    assert_eq!(karukan_engine_poll_async_conversion(ptr::null_mut()), 0);
     karukan_engine_reset(ptr::null_mut());
     karukan_engine_free(ptr::null_mut());
-}
-
-#[test]
-fn poll_async_conversion_is_nonblocking_without_a_subsequent_key() {
-    let e = TestEngine::new();
-    e.press(XKB_KEY_A);
-    let preedit = e.preedit().to_string();
-    let started = Instant::now();
-
-    let _applied = e.poll_async_conversion();
-
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "poll must never wait for model work"
-    );
-    assert_eq!(e.preedit(), preedit);
 }
 
 #[test]

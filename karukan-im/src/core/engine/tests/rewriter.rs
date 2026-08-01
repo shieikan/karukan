@@ -46,19 +46,6 @@ fn user_dict_with(reading: &str, surface: &str) -> Dictionary {
     Dictionary::build_from_json(tmp.path()).unwrap()
 }
 
-fn user_dict_with_surfaces(reading: &str, surfaces: &[&str]) -> Dictionary {
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
-    let candidates = surfaces
-        .iter()
-        .map(|surface| format!(r#"{{"surface":"{surface}","score":1.0}}"#))
-        .collect::<Vec<_>>()
-        .join(",");
-    let json = format!(r#"[{{"reading":"{reading}","candidates":[{candidates}]}}]"#);
-    tmp.write_all(json.as_bytes()).unwrap();
-    tmp.flush().unwrap();
-    Dictionary::build_from_json(tmp.path()).unwrap()
-}
-
 /// Drive the engine by typing a string of characters.
 fn type_string(engine: &mut InputMethodEngine, s: &str) {
     for ch in s.chars() {
@@ -108,167 +95,13 @@ fn assert_not_contains(texts: &[String], forbidden: &str) {
 // ---------- half-width katakana variants ----------
 
 #[test]
-fn single_hiragana_hides_half_width_katakana_without_a_semantic_page() {
-    assert_not_contains(&conversion_texts("あ"), "ｱ");
+fn single_hiragana_emits_half_width_katakana() {
+    assert_contains(&conversion_texts("あ"), "ｱ");
 }
 
 #[test]
-fn hiragana_word_hides_half_width_katakana_without_a_semantic_page() {
-    assert_not_contains(&conversion_texts("がっこう"), "ｶﾞｯｺｳ");
-}
-
-#[test]
-fn short_word_hides_pure_script_variants_without_a_semantic_page() {
-    let texts = conversion_texts("がっこう");
-    assert_not_contains(&texts, "がっこう");
-    assert_not_contains(&texts, "ガッコウ");
-    assert_not_contains(&texts, "ｶﾞｯｺｳ");
-}
-
-#[test]
-fn pure_script_variants_follow_a_full_semantic_page() {
-    let mut engine = composing_engine("がっこう");
-    engine.dicts.user = Some(user_dict_with_surfaces(
-        "がっこう",
-        &[
-            "ガッコウ",
-            "学校00",
-            "学校01",
-            "学校02",
-            "学校03",
-            "学校04",
-            "学校05",
-            "学校06",
-            "学校07",
-            "学校08",
-        ],
-    ));
-    let candidates = engine.build_conversion_candidates("がっこう", 9, false);
-    let texts: Vec<&str> = candidates
-        .iter()
-        .map(|candidate| candidate.text.as_str())
-        .collect();
-
-    assert_not_contains(
-        &texts
-            .iter()
-            .map(|text| (*text).to_string())
-            .collect::<Vec<_>>(),
-        "がっこう",
-    );
-    for variant in ["ガッコウ", "ｶﾞｯｺｳ"] {
-        let index = texts
-            .iter()
-            .position(|text| *text == variant)
-            .unwrap_or_else(|| panic!("missing {variant}: {texts:?}"));
-        assert!(index >= 9, "{variant} must start after page one: {texts:?}");
-    }
-}
-
-#[test]
-fn sentence_like_conversion_omits_pure_script_variants() {
-    let texts = conversion_texts("きょうはいいてんき");
-    assert_not_contains(&texts, "きょうはいいてんき");
-    assert_not_contains(&texts, "キョウハイイテンキ");
-    assert_not_contains(&texts, "ｷｮｳﾊｲｲﾃﾝｷ");
-}
-
-#[test]
-fn sentence_like_explicit_conversion_still_enters_conversion_state() {
-    let mut engine = composing_engine("きょうはいいてんき");
-
-    let result = engine.start_conversion(false);
-
-    assert!(matches!(engine.state(), InputState::Conversion { .. }));
-    assert!(engine.pending_async_request.is_some());
-    assert!(
-        result
-            .actions
-            .iter()
-            .any(|action| matches!(action, EngineAction::HideCandidates))
-    );
-}
-
-#[test]
-fn sentence_live_katakana_is_not_reinserted_into_explicit_candidates() {
-    let reading = "きょうはいいてんき";
-    let mut engine = composing_engine(reading);
-    engine.live.text = "キョウハイイテンキ".to_string();
-
-    engine.start_conversion(false);
-
-    assert_not_contains(&conversion_state_texts(&engine), "キョウハイイテンキ");
-}
-
-#[test]
-fn pending_sentence_conversion_keeps_reading_on_repeated_space() {
-    let mut engine = composing_engine("きょうはいいてんき");
-    engine.start_conversion(false);
-
-    let result = engine.process_key(&press_key(Keysym::SPACE));
-
-    assert_eq!(engine.input_buf.text, "きょうはいいてんき");
-    assert!(matches!(engine.state(), InputState::Conversion { .. }));
-    assert!(engine.pending_async_request.is_some());
-    assert!(result.actions.iter().any(|action| {
-        matches!(action, EngineAction::UpdatePreedit(preedit) if preedit.text() == "きょうはいいてんき")
-    }));
-}
-
-#[test]
-fn typing_during_pending_sentence_conversion_resumes_composing_without_data_loss() {
-    let mut engine = composing_engine("きょうはいいてんき");
-    engine.start_conversion(false);
-
-    let first = engine.process_key(&press('k'));
-    let second = engine.process_key(&press('a'));
-
-    assert_eq!(engine.input_buf.text, "きょうはいいてんきか");
-    assert!(matches!(engine.state(), InputState::Composing { .. }));
-    assert!(
-        !first
-            .actions
-            .iter()
-            .any(|action| matches!(action, EngineAction::Commit(_)))
-    );
-    assert!(
-        !second
-            .actions
-            .iter()
-            .any(|action| matches!(action, EngineAction::Commit(_)))
-    );
-}
-
-#[test]
-fn host_commit_during_pending_sentence_conversion_preserves_raw_reading() {
-    let mut engine = composing_engine("きょうはいいてんき");
-    engine.start_conversion(false);
-
-    let committed = engine.commit();
-
-    assert_eq!(committed, "きょうはいいてんき");
-    assert!(matches!(engine.state(), InputState::Empty));
-}
-
-#[test]
-fn long_dictionary_word_hides_script_variants_without_a_semantic_page() {
-    let mut engine = composing_engine("とうきょうと");
-    engine.dicts.user = Some(user_dict_with("とうきょうと", "東京都"));
-    let texts: Vec<String> = engine
-        .build_conversion_candidates("とうきょうと", 9, false)
-        .into_iter()
-        .map(|candidate| candidate.text)
-        .collect();
-
-    assert_contains(&texts, "東京都");
-    assert_not_contains(&texts, "とうきょうと");
-    assert_not_contains(&texts, "トウキョウト");
-    assert_not_contains(&texts, "ﾄｳｷｮｳﾄ");
-}
-
-#[test]
-fn long_non_hiragana_literal_is_not_filtered_as_a_sentence() {
-    assert_contains(&conversion_texts("12345678"), "12345678");
+fn hiragana_word_emits_half_width_katakana() {
+    assert_contains(&conversion_texts("がっこう"), "ｶﾞｯｺｳ");
 }
 
 #[test]
@@ -421,19 +254,19 @@ fn kagikakko_reading_emits_paired_brackets_in_conversion() {
 }
 
 #[test]
-fn katakana_variants_after_a_semantic_page_carry_width_form_description() {
+fn katakana_variants_carry_width_form_description() {
     // mozc-style width annotation: full-width katakana → `[全]カタカナ`,
     // half-width katakana → `[半]カタカナ`. The hiragana fallback also picks
     // up `[全]ひらがな` since hiragana is intrinsically full-width.
     let mut engine = composing_engine("あ");
-    engine.dicts.user = Some(user_dict_with_surfaces(
-        "あ",
-        &[
-            "意味00", "意味01", "意味02", "意味03", "意味04", "意味05", "意味06", "意味07",
-            "意味08",
-        ],
-    ));
     let candidates = engine.build_conversion_candidates("あ", 9, false);
+
+    let hira = candidates.iter().find(|c| c.text == "あ").unwrap();
+    assert_eq!(
+        hira.description.as_deref(),
+        Some("[全]ひらがな"),
+        "hiragana fallback `あ` should be annotated as `[全]ひらがな`",
+    );
 
     let full = candidates.iter().find(|c| c.text == "ア").unwrap();
     assert_eq!(
@@ -469,116 +302,11 @@ fn typing_three_dots_emits_ellipsis_in_auto_suggest_and_conversion() {
 }
 
 #[test]
-fn typing_a_then_space_hides_half_width_katakana_without_a_semantic_page() {
+fn typing_a_then_space_emits_half_width_katakana() {
     let mut engine = InputMethodEngine::new();
     type_string(&mut engine, "a");
 
     let result = engine.process_key(&press_key(Keysym::SPACE));
     assert!(result.consumed);
-    assert_not_contains(&conversion_state_texts(&engine), "ｱ");
-}
-
-#[test]
-fn numeric_counter_homonyms_coexist_and_ignore_model_count() {
-    type CandidateFingerprint = (
-        usize,
-        String,
-        CandidateSource,
-        Option<String>,
-        Option<String>,
-    );
-
-    let candidates_for = |num_candidates| {
-        let mut engine = composing_engine("10けん");
-        engine.dicts.user = Some(user_dict_with("10けん", "十件"));
-        engine
-            .build_conversion_candidates("10けん", num_candidates, false)
-            .into_iter()
-            .enumerate()
-            .map(|(rank, candidate)| {
-                (
-                    rank,
-                    candidate.text,
-                    candidate.source,
-                    candidate.reading,
-                    candidate.description,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let candidates_3 = candidates_for(3);
-    let candidates_9 = candidates_for(9);
-    assert_eq!(candidates_3, candidates_9);
-
-    for expected in ["十件", "10けん", "10ケン", "10ｹﾝ", "10件", "10軒"] {
-        assert!(
-            candidates_3
-                .iter()
-                .any(|(_, text, _, _, _)| text == expected),
-            "expected deterministic candidate `{expected}`, got {candidates_3:?}"
-        );
-    }
-
-    let dictionary = candidates_3
-        .iter()
-        .find(|(_, text, _, _, _)| text == "十件")
-        .expect("dictionary candidate");
-    assert!(matches!(&dictionary.2, CandidateSource::UserDictionary));
-
-    let counter_ranks: Vec<usize> = ["10件", "10軒"]
-        .into_iter()
-        .map(|text| {
-            let candidate = candidates_3
-                .iter()
-                .find(|(_, candidate_text, _, _, _)| candidate_text == text)
-                .expect("counter rewrite candidate");
-            assert!(matches!(&candidate.2, CandidateSource::Rewriter));
-            assert!(candidate.0 < 9, "counter candidate must remain on page one");
-            candidate.0
-        })
-        .collect();
-    assert!(counter_ranks[0] < counter_ranks[1]);
-
-    let selected_identity = |candidates: &[CandidateFingerprint], rank: usize| {
-        let mut list = CandidateList::new(
-            candidates
-                .iter()
-                .map(|(_, text, _, reading, _)| {
-                    Candidate::with_reading(text.clone(), reading.clone().unwrap_or_default())
-                })
-                .collect(),
-        );
-        list.select(rank);
-        (list.cursor(), list.selected().unwrap().text.clone())
-    };
-    assert_eq!(
-        selected_identity(&candidates_3, counter_ranks[0]),
-        selected_identity(&candidates_9, counter_ranks[0])
-    );
-}
-
-#[test]
-fn numeric_counter_rewriters_stay_on_first_page_with_many_dictionary_matches() {
-    let mut engine = composing_engine("10けん");
-    engine.dicts.user = Some(user_dict_with_surfaces(
-        "10けん",
-        &[
-            "辞書00", "辞書01", "辞書02", "辞書03", "辞書04", "辞書05", "辞書06", "辞書07",
-            "辞書08", "辞書09", "辞書10", "辞書11",
-        ],
-    ));
-
-    let candidates = engine.build_conversion_candidates("10けん", 9, false);
-    let texts: Vec<&str> = candidates
-        .iter()
-        .map(|candidate| candidate.text.as_str())
-        .collect();
-    let preferred = texts.iter().position(|text| *text == "10件");
-    let alternate = texts.iter().position(|text| *text == "10軒");
-
-    assert_eq!(preferred, Some(0));
-    assert_eq!(alternate, Some(1));
-    assert!(preferred.unwrap() < 9);
-    assert!(alternate.unwrap() < 9);
+    assert_contains(&conversion_state_texts(&engine), "ｱ");
 }

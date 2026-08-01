@@ -31,13 +31,12 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-directories = "5"
+directories = "6"
 
 # Error handling
 anyhow.workspace = true
 
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile.workspace = true
 
 [features]

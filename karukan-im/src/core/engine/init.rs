@@ -1,134 +1,28 @@
 //! Engine initialization (model loading, dictionary setup)
 
 use anyhow::{Context, Result};
-use std::thread::{self, JoinHandle};
 use tracing::debug;
 
 use crate::config::settings::StrategyMode;
 
 use super::*;
 
-pub(super) struct InitAssets {
-    system: Option<Dictionary>,
-    user: Option<Dictionary>,
-    learning: Option<LearningCache>,
+/// Create a KanaKanjiConverter from a variant id, optionally setting thread count.
+fn create_converter(variant_id: &str, n_threads: u32) -> Result<KanaKanjiConverter> {
+    let backend = karukan_engine::Backend::from_variant_id(variant_id)?;
+    let mut converter = KanaKanjiConverter::new(backend)?;
+    if n_threads > 0 {
+        converter.set_n_threads(n_threads);
+    }
+    Ok(converter)
 }
 
-fn load_system_dictionary(dict_path: Option<&str>) -> Option<Dictionary> {
-    let path = if let Some(p) = dict_path {
-        std::path::PathBuf::from(p)
-    } else if let Some(data_dir) = Settings::data_dir() {
-        data_dir.join("dict.bin")
+/// Format the n_threads value for debug logging.
+fn threads_label(n_threads: u32) -> String {
+    if n_threads > 0 {
+        n_threads.to_string()
     } else {
-        debug!("Could not determine data directory for system dictionary");
-        return None;
-    };
-
-    if !path.exists() {
-        debug!("System dictionary not found at {:?}, skipping", path);
-        return None;
-    }
-
-    match Dictionary::load(&path) {
-        Ok(dict) => {
-            debug!("System dictionary loaded from {:?}", path);
-            Some(dict)
-        }
-        Err(e) => {
-            debug!("Failed to load system dictionary from {:?}: {}", path, e);
-            None
-        }
-    }
-}
-
-fn load_learning_cache(enabled: bool, max_entries: usize) -> Option<LearningCache> {
-    if !enabled {
-        return None;
-    }
-
-    let Some(path) = Settings::learning_file() else {
-        debug!("Could not determine learning cache path");
-        return Some(LearningCache::new(max_entries));
-    };
-
-    if path.exists() {
-        match LearningCache::load(&path, max_entries) {
-            Ok(cache) => {
-                debug!(
-                    "Learning cache loaded from {:?} ({} entries)",
-                    path,
-                    cache.entry_count()
-                );
-                Some(cache)
-            }
-            Err(e) => {
-                debug!("Failed to load learning cache from {:?}: {}", path, e);
-                Some(LearningCache::new(max_entries))
-            }
-        }
-    } else {
-        debug!("Learning cache not found at {:?}, starting empty", path);
-        Some(LearningCache::new(max_entries))
-    }
-}
-
-fn load_user_dictionaries() -> Option<Dictionary> {
-    let Some(dir) = Settings::user_dict_dir() else {
-        debug!("Could not determine user dictionary directory");
-        return None;
-    };
-
-    if !dir.exists() {
-        debug!(
-            "User dictionary directory {:?} does not exist, skipping",
-            dir
-        );
-        return None;
-    }
-
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        debug!("Failed to read user dictionary directory {:?}", dir);
-        return None;
-    };
-    let mut paths: Vec<std::path::PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .collect();
-
-    if paths.is_empty() {
-        debug!("No files in user dictionary directory {:?}", dir);
-        return None;
-    }
-
-    paths.sort();
-    let mut dicts = Vec::new();
-    for path in &paths {
-        match Dictionary::load_auto(path) {
-            Ok(dict) => {
-                debug!("User dictionary loaded from {:?}", path);
-                dicts.push(dict);
-            }
-            Err(e) => {
-                debug!("Failed to load user dictionary from {:?}: {}", path, e);
-            }
-        }
-    }
-
-    match Dictionary::merge(dicts) {
-        Ok(Some(merged)) => {
-            debug!(
-                "User dictionaries merged successfully ({} files from {:?})",
-                paths.len(),
-                dir
-            );
-            Some(merged)
-        }
-        Ok(None) => None,
-        Err(e) => {
-            debug!("Failed to merge user dictionaries: {}", e);
-            None
-        }
+        "default".to_string()
     }
 }
 
@@ -141,23 +35,6 @@ impl InputMethodEngine {
     /// JSON-RPC server (`init` method). In `Adaptive` mode a light-model
     /// failure is non-fatal (beam search is simply unavailable).
     pub fn init_from_settings(&mut self, settings: &Settings) -> Result<()> {
-        let init_epoch = self.queue_init_from_settings(settings)?;
-        let result = self
-            .worker
-            .wait_for_init(init_epoch)
-            .map_err(|error| anyhow::anyhow!(error));
-        self.wait_for_init_assets();
-        result?;
-        tracing::info!("Karukan init complete: {}", self.model_name());
-        Ok(())
-    }
-
-    /// Start model initialization without waiting on the handler thread.
-    pub fn begin_init_from_settings(&mut self, settings: &Settings) -> Result<()> {
-        self.queue_init_from_settings(settings).map(|_| ())
-    }
-
-    fn queue_init_from_settings(&mut self, settings: &Settings) -> Result<u64> {
         let strategy = settings.conversion.strategy;
         tracing::info!(
             "Karukan init: model={:?}, light_model={:?}, strategy={:?}",
@@ -166,104 +43,66 @@ impl InputMethodEngine {
             strategy,
         );
 
+        self.init_system_dictionary(settings.conversion.dict_path.as_deref());
+        self.init_user_dictionaries();
+        self.init_learning_cache(
+            settings.learning.enabled,
+            LearningConfig {
+                max_entries: settings.learning.max_entries,
+                max_surface_chars: settings.learning.max_surface_chars,
+            },
+        );
+
         let n_threads = settings.conversion.n_threads;
 
-        let main_variant = resolve_variant_id(settings.conversion.model.as_deref())
-            .context("invalid model settings")?;
-        let light_variant = match strategy {
-            StrategyMode::Adaptive | StrategyMode::Light => {
-                match resolve_variant_id(settings.conversion.light_model.as_deref()) {
-                    Ok(id) => Some(id),
-                    Err(error) if strategy == StrategyMode::Adaptive => {
-                        tracing::warn!("Invalid light_model settings, using default: {}", error);
-                        Some(karukan_engine::kanji::registry().default_model.clone())
+        match strategy {
+            StrategyMode::Light => {
+                // Light mode: load light_model into the main (kanji) slot only
+                let light_variant = resolve_variant_id(settings.conversion.light_model.as_deref())
+                    .context("invalid light_model settings")?;
+                self.init_kanji_converter_with_model(&light_variant, n_threads)
+                    .context("failed to initialize light model")?;
+                tracing::info!("Light model loaded into main slot: {}", self.model_name());
+            }
+            StrategyMode::Main => {
+                // Main mode: load main model only, no light model
+                let main_variant = resolve_variant_id(settings.conversion.model.as_deref())
+                    .context("invalid model settings")?;
+                self.init_kanji_converter_with_model(&main_variant, n_threads)
+                    .context("failed to initialize main model")?;
+                tracing::info!("Main model loaded: {}", self.model_name());
+            }
+            StrategyMode::Adaptive => {
+                // Adaptive mode: load both main and light models
+                let main_variant = resolve_variant_id(settings.conversion.model.as_deref())
+                    .context("invalid model settings")?;
+                let light_model = settings.conversion.light_model.clone();
+                self.init_kanji_converter_with_model(&main_variant, n_threads)
+                    .context("failed to initialize default model")?;
+                tracing::info!("Default model loaded: {}", self.model_name());
+
+                // Initialize light model for beam search (non-fatal on failure)
+                let light_variant = match resolve_variant_id(light_model.as_deref()) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("Invalid light_model settings, using default: {}", e);
+                        karukan_engine::kanji::registry().default_model.clone()
                     }
-                    Err(error) => return Err(error).context("invalid light_model settings"),
+                };
+                if let Err(e) = self.init_light_kanji_converter(&light_variant, n_threads) {
+                    tracing::warn!(
+                        "Failed to initialize beam model (light_model={:?}): {}",
+                        light_model,
+                        e
+                    );
+                } else {
+                    tracing::info!("Beam model loaded");
                 }
             }
-            StrategyMode::Main => None,
-        };
-        self.queue_init_assets(settings);
-        let init_epoch = self.worker.begin_init(async_conversion::InitRequest {
-            main_variant,
-            light_variant,
-            strategy,
-            n_threads,
-            config: EngineConfig::from_settings(settings),
-        });
-        Ok(init_epoch)
-    }
-
-    fn queue_init_assets(&mut self, settings: &Settings) {
-        self.poll_init_assets();
-        if self.pending_init_assets.is_some() {
-            return;
         }
 
-        let load_system = self.dicts.system.is_none();
-        let load_user = self.dicts.user.is_none();
-        let load_learning = settings.learning.enabled && self.learning.is_none();
-        let settings = settings.clone();
-        self.pending_init_assets = Some(thread::spawn(move || InitAssets {
-            system: load_system
-                .then(|| load_system_dictionary(settings.conversion.dict_path.as_deref()))
-                .flatten(),
-            user: load_user.then(load_user_dictionaries).flatten(),
-            learning: load_learning
-                .then(|| {
-                    load_learning_cache(settings.learning.enabled, settings.learning.max_entries)
-                })
-                .flatten(),
-        }));
-    }
-
-    pub(super) fn poll_init_assets(&mut self) {
-        let finished = self
-            .pending_init_assets
-            .as_ref()
-            .map(JoinHandle::is_finished)
-            .unwrap_or(false);
-        if !finished {
-            return;
-        }
-
-        let Some(handle) = self.pending_init_assets.take() else {
-            return;
-        };
-        match handle.join() {
-            Ok(assets) => {
-                if self.dicts.system.is_none() {
-                    self.dicts.system = assets.system;
-                }
-                if self.dicts.user.is_none() {
-                    self.dicts.user = assets.user;
-                }
-                if self.learning.is_none() {
-                    self.learning = assets.learning;
-                }
-            }
-            Err(_) => tracing::warn!("Karukan initialization asset loader panicked"),
-        }
-    }
-
-    fn wait_for_init_assets(&mut self) {
-        let Some(handle) = self.pending_init_assets.take() else {
-            return;
-        };
-        match handle.join() {
-            Ok(assets) => {
-                if self.dicts.system.is_none() {
-                    self.dicts.system = assets.system;
-                }
-                if self.dicts.user.is_none() {
-                    self.dicts.user = assets.user;
-                }
-                if self.learning.is_none() {
-                    self.learning = assets.learning;
-                }
-            }
-            Err(_) => tracing::warn!("Karukan initialization asset loader panicked"),
-        }
+        tracing::info!("Karukan init complete: {}", self.model_name());
+        Ok(())
     }
 
     /// Initialize the kanji converter (call this early to avoid latency)
@@ -279,34 +118,34 @@ impl InputMethodEngine {
         variant_id: &str,
         n_threads: u32,
     ) -> Result<()> {
-        let main_variant = resolve_variant_id(Some(variant_id))?;
-        let init_epoch = self.worker.begin_init(async_conversion::InitRequest {
-            main_variant,
-            light_variant: None,
-            strategy: StrategyMode::Main,
-            n_threads,
-            config: self.config.clone(),
-        });
-        self.worker
-            .wait_for_init(init_epoch)
-            .map_err(|error| anyhow::anyhow!(error))?;
+        if self.converters.kanji.is_none() {
+            debug!("Initializing kanji converter with variant: {}", variant_id);
+            let converter = create_converter(variant_id, n_threads)?;
+            debug!(
+                "Kanji converter initialized: {} (n_threads={})",
+                converter.model_display_name(),
+                threads_label(n_threads)
+            );
+            self.converters.kanji = Some(converter);
+        }
         Ok(())
     }
 
     /// Initialize the light model for beam search (generates multiple candidates on Space conversion)
     pub fn init_light_kanji_converter(&mut self, variant_id: &str, n_threads: u32) -> Result<()> {
-        let main_variant = karukan_engine::kanji::registry().default_model.clone();
-        let light_variant = resolve_variant_id(Some(variant_id))?;
-        let init_epoch = self.worker.begin_init(async_conversion::InitRequest {
-            main_variant,
-            light_variant: Some(light_variant),
-            strategy: StrategyMode::Adaptive,
-            n_threads,
-            config: self.config.clone(),
-        });
-        self.worker
-            .wait_for_init(init_epoch)
-            .map_err(|error| anyhow::anyhow!(error))?;
+        if self.converters.light_kanji.is_none() {
+            debug!(
+                "Initializing light kanji converter with variant: {}",
+                variant_id
+            );
+            let converter = create_converter(variant_id, n_threads)?;
+            debug!(
+                "Light kanji converter initialized: {} (n_threads={})",
+                converter.model_display_name(),
+                threads_label(n_threads)
+            );
+            self.converters.light_kanji = Some(converter);
+        }
         Ok(())
     }
 
@@ -348,36 +187,39 @@ impl InputMethodEngine {
     ///
     /// Loads `~/.local/share/karukan-im/learning.tsv` if it exists.
     /// If the file doesn't exist, creates an empty in-memory cache.
-    pub fn init_learning_cache(&mut self, enabled: bool, max_entries: usize) {
+    /// `config.max_surface_chars` caps the surface length `record` accepts;
+    /// entries already on disk are loaded regardless (they can be removed
+    /// with Ctrl+Delete or by eviction).
+    pub fn init_learning_cache(&mut self, enabled: bool, config: LearningConfig) {
         if !enabled || self.learning.is_some() {
             return;
         }
 
-        let Some(path) = Settings::learning_file() else {
-            debug!("Could not determine learning cache path");
-            self.learning = Some(LearningCache::new(max_entries));
-            return;
-        };
-
-        if path.exists() {
-            match LearningCache::load(&path, max_entries) {
+        let cache = match Settings::learning_file() {
+            Some(path) if path.exists() => match LearningCache::load(&path, config) {
                 Ok(cache) => {
                     debug!(
                         "Learning cache loaded from {:?} ({} entries)",
                         path,
                         cache.entry_count()
                     );
-                    self.learning = Some(cache);
+                    cache
                 }
                 Err(e) => {
                     debug!("Failed to load learning cache from {:?}: {}", path, e);
-                    self.learning = Some(LearningCache::new(max_entries));
+                    LearningCache::new(config)
                 }
+            },
+            Some(path) => {
+                debug!("Learning cache not found at {:?}, starting empty", path);
+                LearningCache::new(config)
             }
-        } else {
-            debug!("Learning cache not found at {:?}, starting empty", path);
-            self.learning = Some(LearningCache::new(max_entries));
-        }
+            None => {
+                debug!("Could not determine learning cache path");
+                LearningCache::new(config)
+            }
+        };
+        self.learning = Some(cache);
     }
 
     /// Initialize user dictionaries by scanning the user dictionary directory.
@@ -454,57 +296,5 @@ impl InputMethodEngine {
                 debug!("Failed to merge user dictionaries: {}", e);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod init_asset_tests {
-    use super::*;
-    use std::sync::mpsc;
-
-    fn test_dictionary() -> Dictionary {
-        let file = tempfile::NamedTempFile::new().expect("create dictionary fixture");
-        std::fs::write(
-            file.path(),
-            r#"[{"reading":"てすと","candidates":[{"surface":"試験","score":1.0}]}]"#,
-        )
-        .expect("write dictionary fixture");
-        Dictionary::build_from_json(file.path()).expect("build dictionary fixture")
-    }
-
-    #[test]
-    fn rapid_retries_retain_the_in_flight_asset_loader() {
-        let mut engine = InputMethodEngine::new();
-        engine.dicts.system = Some(test_dictionary());
-        engine.dicts.user = Some(test_dictionary());
-        let mut settings = Settings::default();
-        settings.learning.enabled = false;
-
-        let (release_tx, release_rx) = mpsc::channel();
-        let loader = thread::spawn(move || {
-            let _ = release_rx.recv();
-            InitAssets {
-                system: None,
-                user: None,
-                learning: None,
-            }
-        });
-        let loader_id = loader.thread().id();
-        engine.pending_init_assets = Some(loader);
-
-        for _ in 0..8 {
-            engine.queue_init_assets(&settings);
-        }
-
-        let retained_id = engine
-            .pending_init_assets
-            .as_ref()
-            .expect("asset loader remains owned")
-            .thread()
-            .id();
-        assert_eq!(retained_id, loader_id);
-
-        release_tx.send(()).expect("release asset loader");
-        engine.wait_for_init_assets();
     }
 }

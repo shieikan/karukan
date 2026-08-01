@@ -3,9 +3,8 @@
 use super::*;
 
 impl InputMethodEngine {
-    /// After a destructive edit, keep the raw reading visible so repeated
-    /// Backspace/Delete does not reconvert and rewrite the text after every
-    /// deletion. The next ordinary input refresh resumes live conversion.
+    /// After a destructive edit, show the raw reading so repeated Backspace/Delete
+    /// is legible instead of live-converting every intermediate fragment.
     fn show_raw_composing_after_edit(&mut self) -> EngineResult {
         self.live.text.clear();
         self.chunks.clear();
@@ -18,11 +17,11 @@ impl InputMethodEngine {
 
     /// Common helper for cursor movement: flush romaji, clear live conversion, set new position
     fn move_caret(&mut self, new_pos: usize) -> EngineResult {
-        self.invalidate_async_conversion(false);
         if !self.converters.romaji.buffer().is_empty() {
             self.flush_romaji_to_composed();
             self.converters.romaji.reset();
         }
+        self.live.text.clear();
         self.input_buf.cursor_pos = new_pos;
         self.log_chunk_state("cursor");
         let preedit = self.set_composing_state();
@@ -34,7 +33,6 @@ impl InputMethodEngine {
 
     /// Handle backspace in composing mode
     pub(super) fn backspace_composing(&mut self) -> EngineResult {
-        self.invalidate_async_conversion(false);
         // If romaji buffer is not empty, backspace from buffer (not from composed text)
         if !self.converters.romaji.buffer().is_empty() {
             self.converters.romaji.backspace();
@@ -75,7 +73,6 @@ impl InputMethodEngine {
 
     /// Handle delete key in hiragana mode
     pub(super) fn delete_composing(&mut self) -> EngineResult {
-        self.invalidate_async_conversion(false);
         // If romaji buffer is not empty, don't delete from composed (buffer is at cursor)
         if !self.converters.romaji.buffer().is_empty() {
             return EngineResult::consumed();

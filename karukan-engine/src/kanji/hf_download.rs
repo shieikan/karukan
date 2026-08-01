@@ -6,7 +6,7 @@
 use super::error::KanjiError;
 use super::model_config::{ModelFamily, VariantConfig, registry};
 type Result<T> = super::error::Result<T>;
-use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
+use hf_hub::{HFClientSync, split_id};
 use std::path::PathBuf;
 
 /// Download a GGUF model from HuggingFace Hub
@@ -21,21 +21,18 @@ use std::path::PathBuf;
 /// # Environment Variables
 /// * `HF_TOKEN` - HuggingFace API token (required for private repositories)
 pub fn download_gguf(repo_id: &str, filename: &str) -> Result<PathBuf> {
-    // Check for HF_TOKEN environment variable
-    let mut builder = ApiBuilder::new();
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        builder = builder.with_token(Some(token));
-    }
-    let api = builder
-        .build()
-        .map_err(|e| KanjiError::Download(e.into()))?;
+    // HFClientSync::new() resolves HF_TOKEN (env var or cached login) itself
+    let client = HFClientSync::new().map_err(|e| KanjiError::Download(e.into()))?;
 
-    let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+    let (owner, name) = split_id(repo_id);
+    let repo = client.model(owner, name);
 
     tracing::info!("Downloading {} from {}...", filename, repo_id);
 
     let path = repo
-        .get(filename)
+        .download_file()
+        .filename(filename)
+        .send()
         .map_err(|e| KanjiError::Download(e.into()))?;
 
     tracing::info!("Downloaded to {:?}", path);

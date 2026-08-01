@@ -36,3 +36,5 @@ live_conversion = true
 enabled = true
 # 学習エントリの最大数
 max_entries = 10000
+# 学習する変換結果の最大文字数
+max_surface_chars = 50

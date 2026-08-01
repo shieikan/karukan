@@ -9,8 +9,7 @@
 //! Inputs must be pure decimal digits — mixed text like `20世紀` is left
 //! alone.
 
-use super::{RewriteOutput, Rewriter};
-use crate::kana::{ascii_to_fullwidth_char, fullwidth_to_ascii_char};
+use super::{RewriteOutput, Rewriter, is_pure_digit, to_fullwidth, to_halfwidth};
 
 // ---------- tables ----------
 //
@@ -59,59 +58,6 @@ const DESC_CIRCLED: &str = "丸数字";
 const DESC_HEX: &str = "16進数";
 const DESC_OCT: &str = "8進数";
 const DESC_BIN: &str = "2進数";
-
-// Closed, dependency-free counter readings.  This intentionally accepts only
-// a decimal prefix plus one allowlisted suffix; it is not a general-purpose
-// dictionary or morphological analyzer.
-const DECIMAL_COUNTER_SUFFIXES: [(&str, &[&str]); 9] = [
-    ("けん", &["件", "軒"]),
-    ("かい", &["回", "階"]),
-    ("こ", &["個", "戸"]),
-    ("だい", &["台", "代"]),
-    ("とう", &["頭", "棟"]),
-    ("にん", &["人"]),
-    ("ぼん", &["本"]),
-    ("ぽん", &["本"]),
-    ("まい", &["枚"]),
-];
-
-// ---------- input gates ----------
-
-/// True iff every character is a halfwidth (`0-9`) or fullwidth (`０-９`)
-/// decimal digit, and the string is non-empty.
-fn is_pure_digit(text: &str) -> bool {
-    !text.is_empty()
-        && text
-            .chars()
-            .all(|c| c.is_ascii_digit() || ('\u{FF10}'..='\u{FF19}').contains(&c))
-}
-
-fn to_halfwidth(text: &str) -> String {
-    text.chars().map(fullwidth_to_ascii_char).collect()
-}
-
-fn to_fullwidth(text: &str) -> String {
-    text.chars().map(ascii_to_fullwidth_char).collect()
-}
-
-fn decimal_counter_match(candidate: &str) -> Option<(&str, &[&str])> {
-    DECIMAL_COUNTER_SUFFIXES
-        .iter()
-        .find_map(|(reading_suffix, surface_suffixes)| {
-            let prefix = candidate.strip_suffix(reading_suffix)?;
-            is_pure_digit(prefix).then_some((prefix, *surface_suffixes))
-        })
-}
-
-fn decimal_counter_rewrite(candidate: &str) -> Option<Vec<String>> {
-    let (prefix, surface_suffixes) = decimal_counter_match(candidate)?;
-    Some(
-        surface_suffixes
-            .iter()
-            .map(|surface_suffix| format!("{prefix}{surface_suffix}"))
-            .collect(),
-    )
-}
 
 // ---------- kanji rendering ----------
 
@@ -203,19 +149,6 @@ impl NumberRewriter {
     pub fn new() -> Self {
         Self
     }
-
-    /// Return the first surface for an exact allowlisted decimal-counter
-    /// reading. The same closed table and parser drive `rewrite`, so callers
-    /// do not need to infer counter meaning from candidate text.
-    pub fn preferred_decimal_counter_surface(&self, reading: &str) -> Option<String> {
-        self.decimal_counter_surfaces(reading)?.into_iter().next()
-    }
-
-    /// Return all exact allowlisted decimal-counter surfaces in stable
-    /// preference order.
-    pub fn decimal_counter_surfaces(&self, reading: &str) -> Option<Vec<String>> {
-        decimal_counter_rewrite(reading)
-    }
 }
 
 impl Rewriter for NumberRewriter {
@@ -224,9 +157,6 @@ impl Rewriter for NumberRewriter {
     }
 
     fn rewrite(&self, candidate: &str) -> Vec<RewriteOutput> {
-        if let Some(counters) = decimal_counter_rewrite(candidate) {
-            return counters.into_iter().map(|text| (text, None)).collect();
-        }
         if !is_pure_digit(candidate) {
             return Vec::new();
         }
@@ -416,83 +346,5 @@ mod tests {
         let t = texts(&r.rewrite("99999999999999999999")); // 20 digits, > u64::MAX
         assert!(!t.iter().any(|s| s.starts_with("0x")));
         assert!(!t.iter().any(|s| s.starts_with("0b")));
-    }
-
-    #[test]
-    fn allowlisted_number_counter_composition() {
-        let rewriter = NumberRewriter::new();
-        for (input, expected) in [
-            ("10けん", "10件"),
-            ("3にん", "3人"),
-            ("5こ", "5個"),
-            ("3ぼん", "3本"),
-            ("6ぽん", "6本"),
-            ("2まい", "2枚"),
-            ("4だい", "4台"),
-        ] {
-            assert!(texts(&rewriter.rewrite(input)).contains(&expected.to_string()));
-        }
-
-        for unlisted in ["10冊", "10件", "10ひき", "10センチ", "けん"] {
-            assert!(
-                rewriter.rewrite(unlisted).is_empty(),
-                "unlisted suffix must not be rewritten: {unlisted}"
-            );
-        }
-
-        let pure_number = texts(&rewriter.rewrite("10"));
-        assert!(pure_number.contains(&"十".to_string()));
-        assert!(pure_number.contains(&"0xa".to_string()));
-    }
-
-    #[test]
-    fn allowlisted_number_counter_homonyms_are_ordered() {
-        let rewriter = NumberRewriter::new();
-        for (input, expected) in [
-            ("10けん", vec!["10件", "10軒"]),
-            ("3かい", vec!["3回", "3階"]),
-            ("5こ", vec!["5個", "5戸"]),
-            ("4だい", vec!["4台", "4代"]),
-            ("2とう", vec!["2頭", "2棟"]),
-            ("3にん", vec!["3人"]),
-            ("3ぼん", vec!["3本"]),
-            ("6ぽん", vec!["6本"]),
-            ("2まい", vec!["2枚"]),
-        ] {
-            let preferred = expected[0].to_string();
-            assert_eq!(
-                texts(&rewriter.rewrite(input)),
-                expected
-                    .iter()
-                    .map(|text| (*text).to_string())
-                    .collect::<Vec<_>>(),
-                "unexpected ordered counter output for {input}"
-            );
-            assert_eq!(
-                rewriter.preferred_decimal_counter_surface(input),
-                Some(preferred),
-                "preferred surface must be table-backed for {input}"
-            );
-        }
-
-        assert_eq!(
-            texts(&rewriter.rewrite("１０けん")),
-            vec!["１０件", "１０軒"]
-        );
-        assert_eq!(
-            rewriter.preferred_decimal_counter_surface("１０けん"),
-            Some("１０件".to_string())
-        );
-        for unknown in ["10ひき", "10冊", "10センチ", "10件", "けん"] {
-            assert!(
-                rewriter.rewrite(unknown).is_empty(),
-                "unknown or mixed suffix must remain rejected: {unknown}"
-            );
-            assert_eq!(
-                rewriter.preferred_decimal_counter_surface(unknown),
-                None,
-                "unknown or mixed suffix must not have a preferred surface: {unknown}"
-            );
-        }
     }
 }

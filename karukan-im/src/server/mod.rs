@@ -86,22 +86,13 @@ impl ImServer {
         match method {
             "init" => self.handle_init(),
             "process_key" => {
-                self.retry_initialization_if_needed()?;
                 let params: ProcessKeyParams = parse_params(params)?;
                 let event =
                     KeyEvent::new(Keysym(params.keysym), params.modifiers, !params.is_release);
                 let result = self.engine.process_key(&event);
                 self.key_result(result)
             }
-            "poll_async_conversion" => {
-                let result = self
-                    .engine
-                    .poll_async_conversion()
-                    .unwrap_or_else(EngineResult::not_consumed);
-                self.key_result(result)
-            }
             "select_candidate" => {
-                self.retry_initialization_if_needed()?;
                 let params: SelectCandidateParams = parse_params(params)?;
                 if params.page_index >= CandidateList::DEFAULT_PAGE_SIZE {
                     return Err(RpcError::new(
@@ -152,7 +143,15 @@ impl ImServer {
 
     fn handle_init(&mut self) -> Result<Value, RpcError> {
         if !self.initialized {
-            self.begin_initialization()?;
+            let settings = self
+                .settings
+                .take()
+                .unwrap_or_else(|| Settings::load().unwrap_or_default());
+            if let Err(e) = self.engine.init_from_settings(&settings) {
+                // Keep the settings so a retried `init` uses the same ones.
+                self.settings = Some(settings);
+                return Err(RpcError::new(RpcError::INIT_FAILED, format!("{e:#}")));
+            }
             self.initialized = true;
         }
         serde_json::to_value(InitResult {
@@ -162,28 +161,6 @@ impl ImServer {
         .map_err(internal_error)
     }
 
-    /// Queue model loading on the shared conversion worker. The settings stay
-    /// resident so a failed initialization can be retried by the next key or
-    /// explicit `init` request without blocking the JSON-RPC handler.
-    fn begin_initialization(&mut self) -> Result<(), RpcError> {
-        let settings = self
-            .settings
-            .clone()
-            .unwrap_or_else(|| Settings::load().unwrap_or_default());
-        self.engine
-            .begin_init_from_settings(&settings)
-            .map_err(|e| RpcError::new(RpcError::INIT_FAILED, format!("{e:#}")))?;
-        self.settings = Some(settings);
-        Ok(())
-    }
-
-    fn retry_initialization_if_needed(&mut self) -> Result<(), RpcError> {
-        if self.initialized && !self.engine.is_ready() && !self.engine.is_initializing() {
-            self.begin_initialization()?;
-        }
-        Ok(())
-    }
-
     fn key_result(&self, result: EngineResult) -> Result<Value, RpcError> {
         let actions = result.actions.into_iter().map(to_action).collect();
         serde_json::to_value(KeyResult {
@@ -191,7 +168,6 @@ impl ImServer {
             actions,
             conversion_ms: self.engine.last_conversion_ms(),
             process_key_ms: self.engine.last_process_key_ms(),
-            pending_async: self.engine.has_pending_async_conversion(),
         })
         .map_err(internal_error)
     }
