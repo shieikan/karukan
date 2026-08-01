@@ -3,6 +3,7 @@
 //! This module contains the main `InputMethodEngine` struct that coordinates between
 //! the romaji converter, kanji converter, and manages the IME state.
 
+mod async_conversion;
 mod chunk;
 mod conversion;
 mod cursor;
@@ -17,18 +18,17 @@ mod types;
 pub use types::*;
 
 use input_buffer::InputBuffer;
+use std::thread::JoinHandle;
 
 #[cfg(test)]
 mod tests;
 
-use karukan_engine::{
-    Dictionary, KanaKanjiConverter, LearningCache, LearningConfig, RewriterChain, RomajiConverter,
-};
+use karukan_engine::{Dictionary, LearningCache, LearningConfig, RewriterChain, RomajiConverter};
 use tracing::{debug, trace};
 
 use super::candidate::{Candidate, CandidateList, CandidateSource};
 use super::keycode::{KeyEvent, Keysym};
-use super::preedit::Preedit;
+use super::preedit::{Preedit, PreeditSegment};
 use super::state::InputState;
 use crate::config::settings::Settings;
 
@@ -138,6 +138,17 @@ pub struct InputMethodEngine {
     dicts: Dictionaries,
     /// Learning cache (user conversion history)
     learning: Option<LearningCache>,
+    /// Single owner of all model creation and inference.
+    worker: async_conversion::AsyncConversionWorker,
+    /// Dictionary and learning assets are loaded off the key/RPC thread.
+    pending_init_assets: Option<JoinHandle<init::InitAssets>>,
+    /// Current request metadata owned by the handler and cleared centrally
+    /// whenever input/state invalidation supersedes worker work.
+    pending_async_request: Option<async_conversion::PendingRequestMetadata>,
+    /// Monotonic identity for handler-owned state snapshots.
+    generation: u64,
+    /// Epoch for the proposed chunk cache.
+    chunk_cache_epoch: u64,
 }
 
 impl InputMethodEngine {
@@ -160,16 +171,20 @@ impl InputMethodEngine {
             chunks: Vec::new(),
             dicts: Dictionaries::default(),
             learning: None,
+            worker: async_conversion::AsyncConversionWorker::new(),
+            pending_init_assets: None,
+            pending_async_request: None,
+            generation: 0,
+            chunk_cache_epoch: 0,
         }
     }
 
     /// Create with configuration
     pub fn with_config(config: EngineConfig) -> Self {
-        Self {
-            live: LiveConversion::new(config.live_conversion),
-            config,
-            ..Self::new()
-        }
+        let mut engine = Self::new();
+        engine.live = LiveConversion::new(config.live_conversion);
+        engine.config = config;
+        engine
     }
 
     /// Conversion (inference) time of the last `process_key` /
@@ -186,21 +201,24 @@ impl InputMethodEngine {
 
     /// Get the model name being used
     pub fn model_name(&self) -> String {
-        let main = self
-            .converters
-            .kanji
-            .as_ref()
-            .map(|c| c.model_display_name());
-        let sub = self
-            .converters
-            .light_kanji
-            .as_ref()
-            .map(|c| c.model_display_name());
-        match (main, sub) {
-            (Some(m), Some(s)) => format!("{}+{}", m, s),
-            (Some(m), None) => m.to_string(),
-            _ => "unknown".to_string(),
-        }
+        self.worker.model_name()
+    }
+
+    /// Whether the worker has finished the most recent model initialization.
+    pub fn is_ready(&self) -> bool {
+        self.worker.is_ready()
+    }
+
+    /// Whether model initialization is currently running.
+    pub fn is_initializing(&self) -> bool {
+        self.worker.is_initializing()
+    }
+
+    /// Whether initialization, conversion, or an unpolled completion is
+    /// pending. Adapters can use this signal to drive their own event loop
+    /// without submitting a new key event.
+    pub fn has_pending_async_conversion(&self) -> bool {
+        self.pending_init_assets.is_some() || self.worker.has_pending_work()
     }
 
     /// Get the current state
@@ -224,19 +242,88 @@ impl InputMethodEngine {
     /// the session. fcitx5 may send reset events between activate
     /// and the first keyEvent, which would wipe the context.
     pub fn reset(&mut self) {
+        self.invalidate_async_conversion(true);
         self.state = InputState::Empty;
         self.converters.romaji.reset();
         self.mode = ModeState::default();
         self.input_buf.clear();
-        self.live.text.clear();
-        self.chunks.clear();
         self.metrics = ConversionMetrics::default();
+    }
+
+    /// Invalidate every in-flight model proposal before mutating handler state.
+    /// The worker may finish an older request, but its full snapshot will no
+    /// longer match and `poll_async_conversion` will discard it.
+    pub(super) fn invalidate_async_conversion(&mut self, clear_chunks: bool) {
+        self.invalidate_async_conversion_inner(clear_chunks, true);
+    }
+
+    /// Invalidate worker work while preserving an already displayed live
+    /// conversion.  Alphabet-mode Latin input uses this when there is no kana
+    /// left to reconvert; the next refresh keeps that display by design.
+    pub(super) fn invalidate_async_conversion_preserve_live(&mut self, clear_chunks: bool) {
+        self.invalidate_async_conversion_inner(clear_chunks, false);
+    }
+
+    fn invalidate_async_conversion_inner(&mut self, clear_chunks: bool, clear_live: bool) {
+        self.generation = self.generation.wrapping_add(1);
+        self.chunk_cache_epoch = self.chunk_cache_epoch.wrapping_add(1);
+        self.worker.invalidate();
+        self.pending_async_request = None;
+        self.converters.kanji = None;
+        if clear_live {
+            self.live.text.clear();
+        }
+        if clear_chunks {
+            self.chunks.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_backend(backend: Box<dyn async_conversion::ConversionBackend>) -> Self {
+        let mut engine = Self::new_with_worker(
+            async_conversion::AsyncConversionWorker::with_backend(backend),
+        );
+        engine.live.enabled = true;
+        engine
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_backend_factory(factory: async_conversion::BackendFactory) -> Self {
+        let mut engine = Self::new_with_worker(
+            async_conversion::AsyncConversionWorker::with_backend_factory(factory),
+        );
+        engine.live.enabled = true;
+        engine
+    }
+
+    #[cfg(test)]
+    fn new_with_worker(worker: async_conversion::AsyncConversionWorker) -> Self {
+        let mut engine = Self::new();
+        engine.worker = worker;
+        engine
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_init(&mut self) {
+        self.worker.begin_init(async_conversion::InitRequest {
+            main_variant: "test".to_string(),
+            light_variant: None,
+            strategy: crate::config::settings::StrategyMode::Main,
+            n_threads: 0,
+            config: self.config.clone(),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn published_completion_generation(&self) -> Option<u64> {
+        self.worker.published_completion_generation()
     }
 
     /// If the display is empty, reset to Empty state and return the result.
     /// Returns None if display is not empty (caller should continue normally).
     fn try_reset_if_empty(&mut self) -> Option<EngineResult> {
         if self.build_input_display().is_empty() {
+            self.invalidate_async_conversion(true);
             self.state = InputState::Empty;
             self.input_buf.clear();
             // Erasing the whole buffer ends the composition: drop the live
@@ -321,6 +408,7 @@ impl InputMethodEngine {
     /// left_context: text before cursor
     /// right_context: text after cursor
     pub fn set_surrounding_context(&mut self, left_context: &str, right_context: &str) {
+        self.invalidate_async_conversion(false);
         debug!(
             "set_surrounding_context: left=\"{}\" right=\"{}\"",
             left_context, right_context
@@ -390,6 +478,7 @@ impl InputMethodEngine {
         // Only consume the key when actually switching; otherwise pass through
         // so the system can properly track modifier state.
         if key.is_press && self.mode.current() != InputMode::Hiragana {
+            self.invalidate_async_conversion(true);
             // Bake katakana before switching so preedit doesn't revert
             if self.mode.current() == InputMode::Katakana {
                 self.bake_katakana();
@@ -412,6 +501,8 @@ impl InputMethodEngine {
 
     /// Process a key event
     pub fn process_key(&mut self, key: &KeyEvent) -> EngineResult {
+        self.poll_init_assets();
+        let start = std::time::Instant::now();
         // Log modifier key events for debugging key mapping issues
         if key.keysym.is_modifier() {
             debug!(
@@ -420,50 +511,49 @@ impl InputMethodEngine {
             );
         }
 
-        // Right Alt/Super/Meta/Hyper: one-way non-Hiragana → Hiragana switch
-        if let Some(result) = self.handle_mode_toggle_key(key) {
-            return result;
-        }
-
-        // Modifier-only keys (Shift, Ctrl, Alt_L, Super_L, etc.): pass through
-        if key.keysym.is_modifier() {
-            return EngineResult::not_consumed();
-        }
-
-        // Only process key presses
-        if !key.is_press {
-            return EngineResult::not_consumed();
-        }
-
-        // Ctrl+Shift+L: toggle live conversion (works in all states)
-        if key.modifiers.control_key
+        // Run key handling first. Mutating handlers invalidate the worker
+        // generation before this boundary's poll; state-neutral keys leave a
+        // matching completion available to publish below.
+        let mut result = if let Some(result) = self.handle_mode_toggle_key(key) {
+            result
+        } else if key.keysym.is_modifier() || !key.is_press {
+            // Modifier-only and release events pass through without changing
+            // handler state, but still get the common completion finalizer.
+            EngineResult::not_consumed()
+        } else if key.modifiers.control_key
             && key.modifiers.shift_key
             && (key.keysym == Keysym::KEY_L || key.keysym == Keysym::KEY_L_UPPER)
         {
-            return self.toggle_live_conversion();
-        }
+            self.toggle_live_conversion()
+        } else {
+            // Reset adaptive model flag when starting a new word (first key in
+            // Empty state).
+            if matches!(self.state, InputState::Empty) {
+                self.metrics.adaptive_use_light_model = false;
+            }
 
-        // Reset adaptive model flag when starting a new word (first key in Empty state)
-        if matches!(self.state, InputState::Empty) {
-            self.metrics.adaptive_use_light_model = false;
-        }
+            trace!(
+                "Processing key: {:?} in state: {:?}",
+                key.keysym, self.state
+            );
 
-        trace!(
-            "Processing key: {:?} in state: {:?}",
-            key.keysym, self.state
-        );
+            // conversion_ms reports this key only: 0 unless a conversion runs below
+            self.metrics.conversion_ms = 0;
 
-        let start = std::time::Instant::now();
-        // conversion_ms reports this key only: 0 unless a conversion runs below
-        self.metrics.conversion_ms = 0;
-
-        let shift_active = key.modifiers.shift_key;
-
-        let result = match &self.state {
-            InputState::Empty => self.process_key_empty(key, shift_active),
-            InputState::Composing { .. } => self.process_key_composing(key, shift_active),
-            InputState::Conversion { .. } => self.process_key_conversion(key),
+            let shift_active = key.modifiers.shift_key;
+            match &self.state {
+                InputState::Empty => self.process_key_empty(key, shift_active),
+                InputState::Composing { .. } => self.process_key_composing(key, shift_active),
+                InputState::Conversion { .. } => self.process_key_conversion(key),
+            }
         };
+
+        // Publish a ready completion only at this common boundary. Completion
+        // actions follow the raw key actions, while consumed status remains
+        // owned by the key handler above.
+        if let Some(completion) = self.poll_async_conversion() {
+            result.actions.extend(completion.actions);
+        }
 
         self.metrics.process_key_ms = start.elapsed().as_millis() as u64;
 
@@ -472,14 +562,20 @@ impl InputMethodEngine {
 
     /// Commit any pending input and return the text
     pub fn commit(&mut self) -> String {
+        self.poll_init_assets();
+        // A completion may be the current live conversion even when no new
+        // key arrived. Consume it before commit invalidates the worker epoch.
+        let _ = self.poll_async_conversion();
+        let visible_live_text = std::mem::take(&mut self.live.text);
+        self.invalidate_async_conversion(true);
         match &self.state {
             InputState::Empty => String::new(),
             InputState::Composing { .. } => {
                 // Flush romaji buffer into composed_hiragana
                 self.flush_romaji_to_composed();
                 let reading = self.input_buf.text.clone();
-                let text = if !self.live.text.is_empty() {
-                    self.live.text.clone()
+                let text = if !visible_live_text.is_empty() {
+                    visible_live_text
                 } else {
                     reading.clone()
                 };

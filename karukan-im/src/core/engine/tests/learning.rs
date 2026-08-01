@@ -9,28 +9,55 @@ use karukan_engine::{LearningCache, LearningConfig};
 use super::*;
 use crate::core::engine::display::LEARNING_DELETE_HINT;
 
+fn engine_with_cache(cache: LearningCache) -> InputMethodEngine {
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    engine.learning = Some(cache);
+    engine
+}
+
+fn config_with(max_entries: usize) -> LearningConfig {
+    LearningConfig {
+        max_entries,
+        ..LearningConfig::default()
+    }
+}
+
 /// Engine seeded with a learning entry `reading → surface`, no kanji model.
 /// We bypass `init.rs` (which gates learning on settings + file I/O) and just
-/// inject a populated `LearningCache` directly — these tests assert the
-/// build_conversion_candidates branching, not the load path.
+/// inject a populated `LearningCache` directly so these tests can exercise
+/// candidate behavior without depending on settings or file I/O.
 fn engine_with_learned(reading: &str, surface: &str) -> InputMethodEngine {
     let mut engine = InputMethodEngine::new();
     engine.converters.kanji = None;
     let mut cache = LearningCache::new(LearningConfig::default());
     cache.record(reading, surface);
-    engine.learning = Some(cache);
+    engine_with_cache(cache)
+}
+
+fn candidate_texts(
+    engine: &mut InputMethodEngine,
+    reading: &str,
+    skip_learning: bool,
+) -> Vec<String> {
     engine
+        .build_conversion_candidates(reading, 9, skip_learning)
+        .into_iter()
+        .map(|candidate| candidate.text)
+        .collect()
+}
+
+fn cache_from_tsv(contents: &str) -> LearningCache {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), contents).unwrap();
+    LearningCache::load(file.path(), config_with(100)).unwrap()
 }
 
 #[test]
 fn build_candidates_includes_learning_when_not_skipped() {
     let mut engine = engine_with_learned("あい", "藍");
 
-    let texts: Vec<String> = engine
-        .build_conversion_candidates("あい", 9, false)
-        .into_iter()
-        .map(|c| c.text)
-        .collect();
+    let texts = candidate_texts(&mut engine, "あい", false);
 
     assert!(
         texts.contains(&"藍".to_string()),
@@ -43,16 +70,60 @@ fn build_candidates_includes_learning_when_not_skipped() {
 fn build_candidates_omits_learning_when_skipped() {
     let mut engine = engine_with_learned("あい", "藍");
 
-    let texts: Vec<String> = engine
-        .build_conversion_candidates("あい", 9, true)
-        .into_iter()
-        .map(|c| c.text)
-        .collect();
+    let texts = candidate_texts(&mut engine, "あい", true);
 
     assert!(
         !texts.contains(&"藍".to_string()),
         "Tab path (skip_learning=true) must drop learned `藍`, got {:?}",
         texts,
+    );
+}
+
+#[test]
+fn exact_learning_candidates_preserve_frequency_order() {
+    let mut cache = LearningCache::new(config_with(100));
+    cache.record("あい", "高頻度");
+    cache.record("あい", "高頻度");
+    cache.record("あい", "低頻度");
+    let mut engine = engine_with_cache(cache);
+
+    let texts = candidate_texts(&mut engine, "あい", false);
+
+    assert_eq!(&texts[..2], ["高頻度", "低頻度"]);
+}
+
+#[test]
+fn exact_learning_candidates_preserve_recency_order() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cache = cache_from_tsv(&format!(
+        "# karukan learning cache v1\nあい\t旧\t1\t{}\nあい\t新\t1\t{}\n",
+        now.saturating_sub(30 * 86_400),
+        now,
+    ));
+    let mut engine = engine_with_cache(cache);
+
+    let texts = candidate_texts(&mut engine, "あい", false);
+
+    assert_eq!(&texts[..2], ["新", "旧"]);
+}
+
+#[test]
+fn long_learned_phrase_is_exact_only_for_short_prefixes() {
+    let mut engine = engine_with_learned("あいさつ", "挨拶");
+
+    let prefix = candidate_texts(&mut engine, "あい", false);
+    assert!(
+        !prefix.contains(&"挨拶".to_string()),
+        "a short prefix must not surface a learned long phrase: {prefix:?}"
+    );
+
+    let exact = candidate_texts(&mut engine, "あいさつ", false);
+    assert!(
+        exact.contains(&"挨拶".to_string()),
+        "the exact learned reading must remain available: {exact:?}"
     );
 }
 
@@ -183,12 +254,9 @@ fn ctrl_delete_removes_prefix_twins_so_surface_does_not_resurface() {
 }
 
 #[test]
-fn ctrl_delete_keeps_surface_that_another_source_also_produces() {
-    // #2 regression: the learned surface equals the hiragana reading, which
-    // the fallback ALWAYS produces. That fallback copy is deduped away under
-    // the learning entry; deleting the entry must bring it back (now
-    // non-learning) rather than remove the only row — which is why deletion
-    // rebuilds the conversion instead of dropping the candidate in place.
+fn raw_hiragana_learning_entry_is_not_exposed_on_page_one() {
+    // Raw Hiragana is intentionally omitted from ordinary Hiragana explicit
+    // conversion, including when the same raw text is present in learning.
     let mut engine = engine_with_learned("あい", "あい");
 
     engine.process_key(&press('a'));
@@ -202,24 +270,11 @@ fn ctrl_delete_keeps_surface_that_another_source_also_produces() {
         .selected()
         .unwrap()
         .clone();
-    assert_eq!(selected.text, "あい");
-    assert!(selected.is_deletable());
+    assert_ne!(selected.text, "あい");
+    assert!(!selected.is_deletable());
 
     engine.process_key(&press_ctrl(Keysym::DELETE));
-    assert!(engine.learning.as_ref().unwrap().lookup("あい").is_empty());
-
-    // `あい` survives as an ordinary fallback candidate.
-    let candidates = engine.state().candidates().unwrap();
-    let ai = candidates.candidates().iter().find(|c| c.text == "あい");
-    assert!(
-        ai.is_some(),
-        "the fallback `あい` must survive the deletion, not vanish with the \
-         learning entry",
-    );
-    assert!(
-        !ai.unwrap().is_deletable(),
-        "the surviving `あい` must no longer be flagged as learning",
-    );
+    assert!(!engine.learning.as_ref().unwrap().lookup("あい").is_empty());
 }
 
 #[test]
@@ -390,29 +445,26 @@ fn ctrl_delete_ignores_non_learning_candidate() {
 }
 
 #[test]
-fn ctrl_delete_removes_prefix_matched_entry_by_full_reading() {
-    // A prefix-matched learning candidate carries its own (longer) reading;
-    // deletion must remove the cache entry under that full reading.
+fn short_prefix_does_not_expose_long_learning_entry_for_deletion() {
+    // Composing and explicit conversion use exact-only learning lookup, so a
+    // longer entry is not selectable or deletable from a short prefix.
     let mut engine = engine_with_learned("あいさつ", "挨拶");
 
     engine.process_key(&press('a'));
     engine.process_key(&press('i'));
     engine.process_key(&press_key(Keysym::SPACE));
 
-    let selected = engine
-        .state()
-        .candidates()
-        .unwrap()
-        .selected()
-        .unwrap()
-        .clone();
-    assert_eq!(selected.text, "挨拶");
-    assert_eq!(selected.reading.as_deref(), Some("あいさつ"));
-    assert!(selected.is_deletable());
-
-    engine.process_key(&press_ctrl(Keysym::DELETE));
+    let candidates = engine.state().candidates().unwrap();
     assert!(
-        engine
+        !candidates
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.text == "挨拶"),
+        "short prefix must not expose long learning entry: {:?}",
+        candidates.candidates()
+    );
+    assert!(
+        !engine
             .learning
             .as_ref()
             .unwrap()

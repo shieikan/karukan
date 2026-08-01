@@ -1,6 +1,6 @@
 //! Type definitions for the IME engine
 
-use karukan_engine::{Dictionary, KanaKanjiConverter, RewriterChain, RomajiConverter};
+use karukan_engine::{Dictionary, RewriterChain, RomajiConverter};
 
 use crate::config::settings::StrategyMode;
 
@@ -128,14 +128,35 @@ impl Default for EngineConfig {
     }
 }
 
-/// Converter bundle: romaji → hiragana, kana → kanji (main + light)
+/// Token-count display value returned by the worker.
+///
+/// This compatibility proxy deliberately has no model or backend ownership.
+/// The legacy display helper still asks the `kanji` slot for a token count,
+/// while the actual count is populated only from a worker proposal.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::core) struct CompatibilityTokenCounter {
+    pub token_count: usize,
+}
+
+impl CompatibilityTokenCounter {
+    pub fn count_input_tokens(&self, _reading: &str) -> Result<usize, ()> {
+        Ok(self.token_count)
+    }
+}
+
+/// Converter bundle for handler-owned, non-model conversion state.
+///
+/// The kanji slots are token-count-only compatibility fields for existing
+/// internal tests and callers; production initialization never creates models
+/// here. All model ownership is in [`super::async_conversion::AsyncConversionWorker`].
 pub(in crate::core) struct Converters {
     /// Romaji to hiragana converter
     pub romaji: RomajiConverter,
-    /// Kanji converter (lazy loaded)
-    pub kanji: Option<KanaKanjiConverter>,
-    /// Light model for beam search
-    pub light_kanji: Option<KanaKanjiConverter>,
+    /// Worker-proposed token count for the legacy display helper
+    pub kanji: Option<CompatibilityTokenCounter>,
+    /// Retained empty slot for internal compatibility; never populated
+    #[allow(dead_code)]
+    pub light_kanji: Option<CompatibilityTokenCounter>,
     /// Candidate rewriters (half-width katakana, symbol variants)
     pub rewriters: RewriterChain,
 }
@@ -260,11 +281,20 @@ impl ModeState {
 /// here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::core) struct ComposingChunk {
+    /// Character offset of this chunk in the handler-produced reading plan.
+    pub position: usize,
     /// Hiragana reading for this chunk (≤ N chars).
     pub reading: String,
     /// Model conversion of `reading` — this chunk's slice of the live preedit.
     /// Falls back to `reading` when the model yields nothing.
     pub converted: String,
+    /// Whether `converted` is an accepted result for this exact chunk.
+    ///
+    /// This is deliberately independent from `converted == reading`: a model
+    /// may validly return the raw reading, and an unchanged cached chunk must
+    /// not be reconverted merely because its output happens to equal its
+    /// input.
+    pub fresh: bool,
 }
 
 /// Live conversion state: enabled flag and current converted text
@@ -321,4 +351,6 @@ pub(in crate::core) struct ConversionMetrics {
     /// Adaptive flag: set when the main model exceeded max_latency_ms
     /// Reset when a new word begins (Empty state)
     pub adaptive_use_light_model: bool,
+    /// Token count proposed by the worker for the last matching snapshot.
+    pub token_count: Option<usize>,
 }

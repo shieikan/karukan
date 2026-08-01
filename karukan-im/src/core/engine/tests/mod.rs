@@ -4,6 +4,7 @@ use super::*;
 use crate::core::keycode::KeyModifiers;
 
 mod alphabet;
+mod async_conversion;
 mod basic;
 mod candidates;
 mod chunks;

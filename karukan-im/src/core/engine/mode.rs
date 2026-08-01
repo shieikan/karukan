@@ -14,10 +14,10 @@ impl InputMethodEngine {
             return EngineResult::consumed();
         }
 
+        self.invalidate_async_conversion(true);
         self.mode.set(InputMode::Katakana);
         // Clear live conversion text so katakana mode takes priority on commit
         self.live.text.clear();
-
         let romaji_buffer = self.converters.romaji.buffer().to_string();
 
         if self.input_buf.text.is_empty() && romaji_buffer.is_empty() {
@@ -41,6 +41,8 @@ impl InputMethodEngine {
     /// live result. When toggled OFF, drop any stale converted text so the
     /// preedit reverts to hiragana right away.
     pub(super) fn toggle_live_conversion(&mut self) -> EngineResult {
+        let had_live_conversion = !self.live.text.is_empty();
+        self.invalidate_async_conversion(false);
         self.live.enabled = !self.live.enabled;
         let mode = if self.live.enabled { "ON" } else { "OFF" };
         debug!("Live conversion toggled: {}", mode);
@@ -54,8 +56,7 @@ impl InputMethodEngine {
                 result.actions.push(aux);
                 return result;
             }
-            if !self.live.text.is_empty() {
-                self.live.text.clear();
+            if had_live_conversion {
                 let preedit = self.set_composing_state();
                 return EngineResult::consumed()
                     .with_action(EngineAction::UpdatePreedit(preedit))

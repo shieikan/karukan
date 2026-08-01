@@ -348,3 +348,28 @@ fn test_append_reuses_leading_chunks() {
     // The leading chunk was reused, not reconverted.
     assert_eq!(engine.chunks[0].converted, "KEEP0");
 }
+
+#[test]
+fn test_append_after_fresh_raw_result_leading_chunk_is_not_reconverted() {
+    let mut engine = make_chunk_engine(1);
+    engine.input_buf.insert("あ");
+    engine.chunked_auto_suggest();
+    assert_eq!(engine.chunks[0].reading, "あ");
+
+    // A model may validly return the raw reading. Mark that accepted result
+    // fresh explicitly; equality with `reading` is not a dirty signal.
+    engine.chunks[0].fresh = true;
+    engine.input_buf.insert("い");
+    engine.chunked_auto_suggest();
+
+    let requests = engine.chunk_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.reading.as_str())
+            .collect::<Vec<_>>(),
+        vec!["あ", "い"]
+    );
+    assert!(!requests[0].should_convert);
+    assert!(requests[1].should_convert);
+}

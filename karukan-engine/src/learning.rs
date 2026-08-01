@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A single learned conversion entry.
@@ -200,33 +200,69 @@ impl LearningCache {
 
     /// Save the cache to a TSV file, evicting low-score entries if over capacity.
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
-        self.evict();
+        self.save_with_rename(path, |temporary, destination| {
+            std::fs::rename(temporary, destination)
+        })
+    }
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    /// Save through a same-directory temporary file and atomically rename it.
+    ///
+    /// The rename operation is injected so tests can deterministically prove
+    /// that a failed replacement leaves both destination bytes and live cache
+    /// state untouched.
+    fn save_with_rename<R>(&mut self, path: &Path, rename: R) -> anyhow::Result<()>
+    where
+        R: Fn(&Path, &Path) -> std::io::Result<()>,
+    {
+        let parent = normalized_parent_dir(path);
+        std::fs::create_dir_all(parent)?;
 
-        let file = std::fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
-        writeln!(writer, "# karukan learning cache v1")?;
+        let mut persisted = Self {
+            entries: self.entries.clone(),
+            max_entries: self.max_entries,
+            max_surface_chars: self.max_surface_chars,
+            dirty: self.dirty,
+        };
+        persisted.evict();
 
-        // Sort readings for deterministic output
-        let mut readings: Vec<&String> = self.entries.keys().collect();
-        readings.sort();
+        let (file, temporary_path) = create_temporary_file(path)?;
+        let write_result = (|| -> anyhow::Result<()> {
+            let mut writer = std::io::BufWriter::new(file);
+            writeln!(writer, "# karukan learning cache v1")?;
 
-        for reading in readings {
-            if let Some(entries) = self.entries.get(reading) {
-                for entry in entries {
-                    writeln!(
-                        writer,
-                        "{}\t{}\t{}\t{}",
-                        reading, entry.surface, entry.frequency, entry.last_access
-                    )?;
+            // Sort readings for deterministic output
+            let mut readings: Vec<&String> = persisted.entries.keys().collect();
+            readings.sort();
+
+            for reading in readings {
+                if let Some(entries) = persisted.entries.get(reading) {
+                    for entry in entries {
+                        writeln!(
+                            writer,
+                            "{}\t{}\t{}\t{}",
+                            reading, entry.surface, entry.frequency, entry.last_access
+                        )?;
+                    }
                 }
             }
+
+            writer.flush()?;
+            let file = writer.into_inner().map_err(|error| error.into_error())?;
+            file.sync_all()?;
+            drop(file);
+            rename(&temporary_path, path)?;
+            // Best-effort directory barrier after the atomic replacement. Some
+            // platforms/filesystems do not support syncing directory handles.
+            let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temporary_path);
+            return write_result;
         }
 
-        writer.flush()?;
+        self.entries = persisted.entries;
         self.dirty = false;
         Ok(())
     }
@@ -282,6 +318,44 @@ impl LearningCache {
             }
         }
     }
+}
+
+const MAX_TEMPORARY_FILE_ATTEMPTS: usize = 16;
+
+fn normalized_parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn temporary_path(path: &Path, attempt: usize) -> PathBuf {
+    let parent = normalized_parent_dir(path);
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "learning-cache".into());
+    file_name.push(format!(".tmp-{}-{attempt}", std::process::id()));
+    parent.join(file_name)
+}
+
+fn create_temporary_file(path: &Path) -> anyhow::Result<(std::fs::File, PathBuf)> {
+    for attempt in 0..MAX_TEMPORARY_FILE_ATTEMPTS {
+        let temporary_path = temporary_path(path, attempt);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((file, temporary_path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "could not create a unique temporary learning cache file after {MAX_TEMPORARY_FILE_ATTEMPTS} attempts"
+    ))
 }
 
 /// Compute a candidate score: recency-weighted with frequency bonus.
@@ -601,5 +675,106 @@ mod tests {
         let cache = LearningCache::load(file.path(), config_with(100)).unwrap();
         // Only the first valid line should be loaded
         assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn red_atomic_learning_save_keeps_original_on_replacement_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("learning.tsv");
+        let original = b"# prior destination\nprior\tbytes\t1\t2\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut cache = cache_with(1);
+        cache.record("あい", "藍");
+        cache.record("うえ", "上");
+        assert!(cache.is_dirty());
+        let result = cache.save_with_rename(&path, |_temporary, _destination| {
+            Err(std::io::Error::other("deterministic rename failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.lookup("あい")[0].0, "藍");
+        assert_eq!(cache.lookup("うえ")[0].0, "上");
+        assert!(cache.is_dirty());
+
+        let temporary_files: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "learning.tsv")
+            .collect();
+        assert!(
+            temporary_files.is_empty(),
+            "temporary files left behind: {temporary_files:?}"
+        );
+    }
+
+    #[test]
+    fn relative_destination_normalizes_empty_parent_to_current_directory() {
+        assert_eq!(
+            normalized_parent_dir(Path::new("learning.tsv")),
+            Path::new(".")
+        );
+        assert_eq!(
+            normalized_parent_dir(Path::new("cache/learning.tsv")),
+            Path::new("cache")
+        );
+    }
+
+    #[test]
+    fn save_advances_when_first_temporary_path_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("learning.tsv");
+        let occupied_path = temporary_path(&path, 0);
+        let marker = b"must not be overwritten";
+        std::fs::write(&occupied_path, marker).unwrap();
+
+        let mut cache = cache_with(100);
+        cache.record("あい", "藍");
+        cache.save(&path).unwrap();
+
+        assert_eq!(std::fs::read(&occupied_path).unwrap(), marker);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("あい\t藍\t1\t")
+        );
+    }
+
+    #[test]
+    fn all_temporary_path_collisions_preserve_destination_and_live_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("learning.tsv");
+        let original = b"# prior destination\nprior\tbytes\t1\t2\n";
+        std::fs::write(&path, original).unwrap();
+
+        let markers: Vec<Vec<u8>> = (0..MAX_TEMPORARY_FILE_ATTEMPTS)
+            .map(|attempt| {
+                let marker = format!("occupied temporary path {attempt}").into_bytes();
+                std::fs::write(temporary_path(&path, attempt), &marker).unwrap();
+                marker
+            })
+            .collect();
+
+        let mut cache = cache_with(1);
+        cache.record("あい", "藍");
+        cache.record("うえ", "上");
+        assert!(cache.is_dirty());
+
+        let result = cache.save(&path);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.lookup("あい")[0].0, "藍");
+        assert_eq!(cache.lookup("うえ")[0].0, "上");
+        assert!(cache.is_dirty());
+        for (attempt, marker) in markers.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(temporary_path(&path, attempt)).unwrap(),
+                *marker
+            );
+        }
     }
 }

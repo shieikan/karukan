@@ -75,6 +75,7 @@ fn test_live_conversion_keeps_converted_preedit_but_hides_candidates_for_long_re
     engine.chunks = vec![ComposingChunk {
         reading: "ばあい".to_string(),
         converted: "場合".to_string(),
+        ..ComposingChunk::default()
     }];
 
     let result = engine.refresh_input_state();
@@ -119,6 +120,7 @@ fn test_live_conversion_waits_for_enough_reading_before_showing_conversion() {
     engine.chunks = vec![ComposingChunk {
         reading: "ばあ".to_string(),
         converted: "婆".to_string(),
+        ..ComposingChunk::default()
     }];
 
     let result = engine.refresh_input_state();
@@ -128,6 +130,32 @@ fn test_live_conversion_waits_for_enough_reading_before_showing_conversion() {
         "short ambiguous fragments should stay in raw reading form"
     );
     assert_eq!(updated_preedit_text(&result).as_deref(), Some("ばあ"));
+}
+
+#[test]
+fn pending_forward_append_projects_completed_prefix_plus_raw_suffix() {
+    let mut engine = InputMethodEngine::with_config(EngineConfig {
+        live_conversion: true,
+        composing_chunk_len: 30,
+        ..EngineConfig::default()
+    });
+    engine.input_buf.insert("こう");
+    engine.chunks = vec![ComposingChunk {
+        position: 0,
+        reading: "こう".to_string(),
+        converted: "候".to_string(),
+        fresh: true,
+    }];
+    engine.live.text = "候".to_string();
+    engine.set_composing_state();
+
+    engine.input_buf.insert("いう");
+    let result = engine.refresh_input_state();
+
+    assert_eq!(engine.chunk_requests()[0].reading, "こういう");
+    assert!(engine.chunk_requests()[0].should_convert);
+    assert_eq!(engine.live.text, "候いう");
+    assert_eq!(updated_preedit_text(&result).as_deref(), Some("候いう"));
 }
 
 #[test]
@@ -142,10 +170,12 @@ fn test_live_conversion_backspace_shows_raw_reading_while_deleting() {
         ComposingChunk {
             reading: "ばあ".to_string(),
             converted: "婆".to_string(),
+            ..ComposingChunk::default()
         },
         ComposingChunk {
             reading: "い".to_string(),
             converted: "い".to_string(),
+            ..ComposingChunk::default()
         },
     ];
     engine.live.text = "婆い".to_string();
@@ -178,14 +208,17 @@ fn test_live_conversion_delete_shows_raw_reading_while_deleting() {
         ComposingChunk {
             reading: "ば".to_string(),
             converted: "婆".to_string(),
+            ..ComposingChunk::default()
         },
         ComposingChunk {
             reading: "あ".to_string(),
             converted: "亜".to_string(),
+            ..ComposingChunk::default()
         },
         ComposingChunk {
             reading: "い".to_string(),
             converted: "意".to_string(),
+            ..ComposingChunk::default()
         },
     ];
     engine.live.text = "婆亜意".to_string();

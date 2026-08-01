@@ -38,33 +38,78 @@ fn is_pure_kana(text: &str) -> bool {
         .all(|c| matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A0}'..='\u{30FF}'))
 }
 
+fn is_decimal_prefix_digit(c: char) -> bool {
+    matches!(c, '0'..='9' | '\u{FF10}'..='\u{FF19}')
+}
+
+fn is_decimal_prefix_suffix_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3041}'..='\u{3096}'
+            | '\u{3099}'..='\u{309F}'
+            | '\u{30A1}'..='\u{30FA}'
+            | '\u{30FC}'..='\u{30FF}'
+    )
+}
+
+fn decimal_prefix_parts(text: &str) -> Option<(&str, &str)> {
+    let prefix_end = text
+        .char_indices()
+        .take_while(|&(_, c)| is_decimal_prefix_digit(c))
+        .last()
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    if prefix_end == 0 {
+        return None;
+    }
+
+    let (prefix, suffix) = text.split_at(prefix_end);
+    if suffix.is_empty() || !suffix.chars().all(is_decimal_prefix_suffix_char) {
+        return None;
+    }
+
+    Some((prefix, suffix))
+}
+
 impl Rewriter for HalfWidthKatakanaRewriter {
     fn name(&self) -> &'static str {
         "katakana_form"
     }
 
     fn rewrite(&self, candidate: &str) -> Vec<RewriteOutput> {
-        if candidate.is_empty() || !is_pure_kana(candidate) {
-            return Vec::new();
-        }
+        let (prefix, suffix) = if let Some(parts) = decimal_prefix_parts(candidate) {
+            parts
+        } else {
+            if candidate.is_empty() || !is_pure_kana(candidate) {
+                return Vec::new();
+            }
+            ("", candidate)
+        };
 
         let mut out: Vec<RewriteOutput> = Vec::new();
 
-        // Full-width katakana (only if candidate contains hiragana)
-        let full_kata = if contains_hiragana(candidate) {
-            let v = hiragana_to_katakana(candidate);
-            if v != candidate {
-                out.push((v.clone(), Some(FULL_KATAKANA_DESC.to_string())));
-                v
-            } else {
-                candidate.to_string()
-            }
+        let full_kata_suffix = if contains_hiragana(suffix) {
+            hiragana_to_katakana(suffix)
         } else {
-            candidate.to_string()
+            suffix.to_string()
+        };
+        let full_kata = if prefix.is_empty() {
+            full_kata_suffix.clone()
+        } else {
+            format!("{prefix}{full_kata_suffix}")
         };
 
+        // Full-width katakana (only if candidate contains hiragana)
+        if contains_hiragana(suffix) && full_kata != candidate {
+            out.push((full_kata.clone(), Some(FULL_KATAKANA_DESC.to_string())));
+        }
+
         // Half-width katakana
-        let half = katakana_to_half_width(&full_kata);
+        let half_suffix = katakana_to_half_width(&full_kata_suffix);
+        let half = if prefix.is_empty() {
+            half_suffix
+        } else {
+            format!("{prefix}{half_suffix}")
+        };
         if half != candidate && !out.iter().any(|(s, _)| s == &half) {
             out.push((half, Some(HALF_KATAKANA_DESC.to_string())));
         }
@@ -109,6 +154,125 @@ mod tests {
     fn full_katakana_emits_half_only() {
         let r = HalfWidthKatakanaRewriter;
         assert_eq!(texts(&r.rewrite("アイウ")), vec!["ｱｲｳ".to_string()]);
+    }
+
+    #[test]
+    fn decimal_prefix_preserves_spelling_and_emits_katakana_suffix_variants() {
+        let r = HalfWidthKatakanaRewriter;
+        let fixtures: [(&str, Vec<&str>); 4] = [
+            ("10けん", vec!["10ケン", "10ｹﾝ"]),
+            ("１０けん", vec!["１０ケン", "１０ｹﾝ"]),
+            ("1０けん", vec!["1０ケン", "1０ｹﾝ"]),
+            ("10ケーキ", vec!["10ｹｰｷ"]),
+        ];
+
+        for (candidate, expected) in fixtures {
+            assert_eq!(
+                texts(&r.rewrite(candidate)),
+                expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                "unexpected decimal-prefix rewrite for {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_width_decimal_prefix_preserves_codepoints_and_rejects_suffix_boundaries() {
+        let r = HalfWidthKatakanaRewriter;
+
+        let allowed_endpoints: [(u32, Vec<&str>); 8] = [
+            (0x3041, vec!["10ァ", "10ｧ"]),
+            (0x3096, vec!["10ヶ"]),
+            (0x3099, vec![]),
+            (0x309F, vec![]),
+            (0x30A1, vec!["10ｧ"]),
+            (0x30FA, vec![]),
+            (0x30FC, vec!["10ｰ"]),
+            (0x30FF, vec![]),
+        ];
+        for (code_point, expected) in allowed_endpoints {
+            let suffix = char::from_u32(code_point).expect("valid Unicode endpoint");
+            let suffix_text = suffix.to_string();
+            let candidate = format!("10{suffix}");
+            let (prefix, parsed_suffix) = decimal_prefix_parts(&candidate)
+                .unwrap_or_else(|| panic!("allowed suffix endpoint rejected: U+{code_point:04X}"));
+            assert_eq!(prefix, "10", "prefix changed for U+{code_point:04X}");
+            assert_eq!(
+                parsed_suffix, suffix_text,
+                "suffix changed for U+{code_point:04X}"
+            );
+            assert_eq!(
+                texts(&r.rewrite(&candidate)),
+                expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                "unexpected rewrite for allowed suffix endpoint U+{code_point:04X}"
+            );
+        }
+
+        for code_point in [0x3040, 0x3097, 0x3098, 0x30A0, 0x30FB, 0x3100] {
+            let suffix = char::from_u32(code_point).expect("valid Unicode boundary");
+            let candidate = format!("10{suffix}");
+            assert!(
+                decimal_prefix_parts(&candidate).is_none(),
+                "rejected suffix boundary was accepted: U+{code_point:04X}"
+            );
+            assert!(
+                r.rewrite(&candidate).is_empty(),
+                "unexpected rewrite for rejected suffix boundary U+{code_point:04X}"
+            );
+        }
+
+        for candidate in ["10けん!", "10.けん", "10けん。"] {
+            assert!(
+                decimal_prefix_parts(candidate).is_none(),
+                "punctuation suffix was accepted: {candidate:?}"
+            );
+            assert!(
+                r.rewrite(candidate).is_empty(),
+                "unexpected rewrite for {candidate:?}"
+            );
+        }
+
+        for candidate in [
+            "10゠けん",
+            "10・けん",
+            "10ケン・",
+            "10,けん",
+            "10、けん",
+            "",
+            "10",
+            "abc",
+            "10abc",
+            "10ｹﾝ",
+            "10件",
+            "10けんabc",
+        ] {
+            assert!(
+                r.rewrite(candidate).is_empty(),
+                "unexpected rewrite for {candidate:?}"
+            );
+        }
+
+        let legacy_contrasts: [(&str, Vec<&str>); 2] = [("゠", vec![]), ("・", vec!["･"])];
+        for (zero_prefix, expected) in legacy_contrasts {
+            assert!(
+                is_pure_kana(zero_prefix),
+                "legacy pure-kana gate changed for {zero_prefix:?}"
+            );
+            assert_eq!(
+                texts(&r.rewrite(zero_prefix)),
+                expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                "legacy zero-prefix output changed for {zero_prefix:?}"
+            );
+
+            let decimal_prefixed = format!("10{zero_prefix}");
+            assert!(
+                decimal_prefix_parts(&decimal_prefixed).is_none(),
+                "decimal-only rejection boundary was accepted for {zero_prefix:?}"
+            );
+            assert!(
+                r.rewrite(&decimal_prefixed).is_empty(),
+                "unexpected decimal-prefixed rewrite for {zero_prefix:?}"
+            );
+        }
     }
 
     #[test]

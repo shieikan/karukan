@@ -174,6 +174,38 @@ pub extern "C" fn karukan_engine_is_empty(engine: *const KarukanEngine) -> c_int
     }
 }
 
+/// Check whether the most recent model initialization completed successfully.
+#[unsafe(no_mangle)]
+pub extern "C" fn karukan_engine_is_ready(engine: *const KarukanEngine) -> c_int {
+    let engine = ffi_ref!(engine, 0);
+    if engine.engine.is_ready() { 1 } else { 0 }
+}
+
+/// Check whether model initialization is currently running.
+#[unsafe(no_mangle)]
+pub extern "C" fn karukan_engine_is_initializing(engine: *const KarukanEngine) -> c_int {
+    let engine = ffi_ref!(engine, 0);
+    if engine.engine.is_initializing() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Check whether initialization, conversion, or an unpolled completion is
+/// pending. Frontends use this to schedule a bounded nonblocking poll.
+#[unsafe(no_mangle)]
+pub extern "C" fn karukan_engine_has_pending_async_conversion(
+    engine: *const KarukanEngine,
+) -> c_int {
+    let engine = ffi_ref!(engine, 0);
+    if engine.engine.has_pending_async_conversion() {
+        1
+    } else {
+        0
+    }
+}
+
 /// Commit any pending input.
 /// Returns 1 if text was committed, 0 otherwise.
 #[unsafe(no_mangle)]

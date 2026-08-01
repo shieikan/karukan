@@ -1,7 +1,7 @@
 console.log('app.js loaded - version 2 with token visualization');
 
 // API endpoint
-const API_BASE = 'http://localhost:3000/api';
+const API_BASE = '/api';
 
 // DOM elements
 const romajiInput = document.getElementById('romaji-input');
@@ -38,6 +38,64 @@ let debounceTimer = null;
 let currentMode = 'romaji'; // 'romaji' or 'hiragana'
 let currentModel = null;
 let availableModels = [];
+const requestCoordinator = KarukanRequestState.createRequestCoordinator({ getSnapshot: getRequestSnapshot });
+
+function getRequestSnapshot() {
+    return {
+        input: currentMode === 'romaji' ? romajiInput.value : directHiraganaInput.value,
+        romajiInput: romajiInput.value,
+        directHiraganaInput: directHiraganaInput.value,
+        context: contextInput ? contextInput.value : '',
+        model: currentModel || '',
+        mode: currentMode,
+        candidateCount: numCandidatesInput ? numCandidatesInput.value : '',
+        beamSetting: beamSearchTypeSelect ? beamSearchTypeSelect.value : 'true',
+    };
+}
+
+function invalidateRequestState() {
+    return requestCoordinator.invalidate(getRequestSnapshot());
+}
+
+function clearDerivedOutput() {
+    hiraganaOutput.textContent = '';
+    bufferDisplay.textContent = '';
+    kanjiCandidates.innerHTML = '<p class="placeholder-text">Type to see kanji candidates</p>';
+    inferenceTime.textContent = '';
+    if (tokenDisplay) tokenDisplay.innerHTML = '<p class="placeholder-text">Tokens will appear here</p>';
+    if (tokenCount) tokenCount.textContent = '';
+
+    updateCharCount(romajiCharCount, 0);
+    updateCharCount(hiraganaCharCount, 0);
+    updateCharCount(directHiraganaCharCount, 0);
+    updateCharCount(kanjiCharCount, 0);
+}
+
+function prepareForStateChange() {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+    invalidateRequestState();
+    clearDerivedOutput();
+}
+
+function scheduleKanjiConversion(hiragana, expectedTicket = null) {
+    clearTimeout(debounceTimer);
+    const expectedSnapshot = expectedTicket ? expectedTicket.snapshot : getRequestSnapshot();
+    debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        if (expectedTicket && !requestCoordinator.isCurrent(expectedTicket)) return;
+        if (!requestCoordinator.isSnapshotCurrent(expectedSnapshot)) return;
+        convertToKanji(hiragana, expectedSnapshot);
+    }, 300);
+}
+
+async function reissueCurrentInput() {
+    if (currentMode === 'romaji' && romajiInput.value) {
+        await handleRomajiInput({ target: romajiInput });
+    } else if (currentMode === 'hiragana' && directHiraganaInput.value) {
+        await handleDirectHiraganaInput({ target: directHiraganaInput });
+    }
+}
 
 // Initialize
 document.addEventListener('DOMContentLoaded', async () => {
@@ -55,7 +113,12 @@ async function loadModels() {
 
         const data = await response.json();
         availableModels = data.models;
+        const modelChanged = data.default !== currentModel;
         currentModel = data.default;
+
+        if (modelChanged) {
+            prepareForStateChange();
+        }
 
         // Populate select with proper display names
         modelSelect.innerHTML = availableModels.map(model =>
@@ -65,6 +128,9 @@ async function loadModels() {
         ).join('');
 
         updateModelStatus();
+        if (modelChanged) {
+            await reissueCurrentInput();
+        }
     } catch (error) {
         console.error('Error loading models:', error);
         modelSelect.innerHTML = '<option value="">Error loading models</option>';
@@ -120,18 +186,14 @@ function setupEventListeners() {
     exampleBtns.forEach(btn => {
         btn.addEventListener('click', async () => {
             const text = btn.getAttribute('data-text');
-            // Clear first, then set values
-            await clearAll();
+            // Clear first, then set values only if this action is still current.
+            if (!await clearAll()) return;
             // Make sure we're in romaji mode
             if (currentMode !== 'romaji') {
-                currentMode = 'romaji';
-                romajiModeBtn.classList.add('active');
-                hiraganaModeBtn.classList.remove('active');
-                romajiSection.classList.remove('hidden');
-                hiraganaSection.classList.add('hidden');
+                setModeUi('romaji');
             }
             romajiInput.value = text;
-            handleRomajiInput({ target: romajiInput });
+            await handleRomajiInput({ target: romajiInput });
         });
     });
 
@@ -139,27 +201,22 @@ function setupEventListeners() {
     exampleCtxBtns.forEach((btn, idx) => {
         console.log(`Attaching listener to context button ${idx}:`, btn.getAttribute('data-text'));
         btn.addEventListener('click', async () => {
-            console.log('Context button clicked!');
             const hiragana = btn.getAttribute('data-text');
             const context = btn.getAttribute('data-context');
-            console.log(`Hiragana: ${hiragana}, Context: ${context}`);
+            if (!await clearAll()) return;
+
             // Set context
             if (contextInput) {
                 contextInput.value = context;
-                console.log('Context set to:', contextInput.value);
             } else {
                 console.error('contextInput element not found!');
             }
             // Switch to hiragana mode and set input
             if (currentMode !== 'hiragana') {
-                currentMode = 'hiragana';
-                romajiModeBtn.classList.remove('active');
-                hiraganaModeBtn.classList.add('active');
-                romajiSection.classList.add('hidden');
-                hiraganaSection.classList.remove('hidden');
+                setModeUi('hiragana');
             }
             directHiraganaInput.value = hiragana;
-            console.log('Calling convertToKanji with:', hiragana);
+            prepareForStateChange();
             // Directly convert to kanji
             await convertToKanji(hiragana);
         });
@@ -172,61 +229,55 @@ async function handleModelChange(e) {
 
     currentModel = newModel;
     updateModelStatus(true);
+    prepareForStateChange();
 
     // Trigger re-conversion with new model if there's input
-    if (currentMode === 'romaji' && romajiInput.value) {
-        await handleRomajiInput({ target: romajiInput });
-    } else if (currentMode === 'hiragana' && directHiraganaInput.value) {
-        await handleDirectHiraganaInput({ target: directHiraganaInput });
-    }
+    await reissueCurrentInput();
 
     updateModelStatus(false);
 }
 
 async function handleParamChange() {
+    prepareForStateChange();
+
     // Trigger re-conversion with new parameters if there's input
-    if (currentMode === 'romaji' && romajiInput.value) {
-        await handleRomajiInput({ target: romajiInput });
-    } else if (currentMode === 'hiragana' && directHiraganaInput.value) {
-        await handleDirectHiraganaInput({ target: directHiraganaInput });
-    }
+    await reissueCurrentInput();
 }
 
 function switchMode(mode) {
-    currentMode = mode;
+    setModeUi(mode);
 
     if (mode === 'romaji') {
-        romajiModeBtn.classList.add('active');
-        hiraganaModeBtn.classList.remove('active');
-        romajiSection.classList.remove('hidden');
-        hiraganaSection.classList.add('hidden');
         romajiInput.focus();
     } else {
-        romajiModeBtn.classList.remove('active');
-        hiraganaModeBtn.classList.add('active');
-        romajiSection.classList.add('hidden');
-        hiraganaSection.classList.remove('hidden');
         directHiraganaInput.focus();
     }
 
     clearAll();
 }
 
+function setModeUi(mode) {
+    currentMode = mode;
+    const isRomaji = mode === 'romaji';
+    romajiModeBtn.classList.toggle('active', isRomaji);
+    hiraganaModeBtn.classList.toggle('active', !isRomaji);
+    romajiSection.classList.toggle('hidden', !isRomaji);
+    hiraganaSection.classList.toggle('hidden', isRomaji);
+}
+
 async function handleRomajiInput(e) {
     const input = e.target.value;
+
+    prepareForStateChange();
 
     // Update romaji character count
     updateCharCount(romajiCharCount, input.length);
 
     if (!input) {
-        hiraganaOutput.textContent = '';
-        bufferDisplay.textContent = '';
-        kanjiCandidates.innerHTML = '<p class="placeholder-text">Type to see kanji candidates</p>';
-        inferenceTime.textContent = '';
-        updateCharCount(hiraganaCharCount, 0);
-        updateCharCount(kanjiCharCount, 0);
         return;
     }
+
+    const ticket = requestCoordinator.begin('romaji');
 
     try {
         // Step 1: Romaji -> Hiragana
@@ -234,71 +285,78 @@ async function handleRomajiInput(e) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ input, incremental: false }),
+            signal: ticket.signal,
         });
 
         if (!romajiResponse.ok) throw new Error('Romaji conversion failed');
 
         const romajiData = await romajiResponse.json();
-        hiraganaOutput.textContent = romajiData.output;
-        bufferDisplay.textContent = romajiData.buffer;
-
-        // Get full hiragana (including buffer)
         const hiragana = romajiData.output + romajiData.buffer;
 
-        // Update hiragana character count
-        updateCharCount(hiraganaCharCount, hiragana.length);
+        requestCoordinator.commit(ticket, () => {
+            if (!hiragana) {
+                clearDerivedOutput();
+                return;
+            }
 
-        if (!hiragana) {
-            kanjiCandidates.innerHTML = '<p class="placeholder-text">Type to see kanji candidates</p>';
-            inferenceTime.textContent = '';
-            return;
-        }
-
-        // Step 2: Hiragana -> Kanji (debounced)
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => convertToKanji(hiragana), 300);
+            hiraganaOutput.textContent = romajiData.output;
+            bufferDisplay.textContent = romajiData.buffer;
+            updateCharCount(hiraganaCharCount, hiragana.length);
+            scheduleKanjiConversion(hiragana, ticket);
+        });
 
     } catch (error) {
-        console.error('Error:', error);
-        hiraganaOutput.textContent = 'Error';
-        bufferDisplay.textContent = '';
+        if (isAbortError(error) || !requestCoordinator.isCurrent(ticket)) return;
+        requestCoordinator.commit(ticket, () => {
+            clearDerivedOutput();
+            hiraganaOutput.textContent = 'Error';
+        });
+    } finally {
+        requestCoordinator.finish(ticket);
     }
 }
 
 async function handleDirectHiraganaInput(e) {
     const hiragana = e.target.value;
 
+    prepareForStateChange();
+
     // Update direct hiragana character count
     updateCharCount(directHiraganaCharCount, hiragana.length);
 
     if (!hiragana) {
-        kanjiCandidates.innerHTML = '<p class="placeholder-text">Type to see kanji candidates</p>';
-        inferenceTime.textContent = '';
-        updateCharCount(kanjiCharCount, 0);
         return;
     }
 
     // Debounced conversion
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => convertToKanji(hiragana), 300);
+    scheduleKanjiConversion(hiragana);
 }
 
-async function convertToKanji(hiragana) {
-    kanjiCandidates.innerHTML = '<p class="loading-text">Converting...</p>';
-    inferenceTime.textContent = '';
+async function convertToKanji(hiragana, expectedSnapshot = null) {
+    if (expectedSnapshot && !requestCoordinator.isSnapshotCurrent(expectedSnapshot)) return;
+
+    const ticket = requestCoordinator.begin('kanji');
+    if (!requestCoordinator.commit(ticket, () => {
+        kanjiCandidates.innerHTML = '<p class="loading-text">Converting...</p>';
+        inferenceTime.textContent = '';
+        updateCharCount(kanjiCharCount, 0);
+    })) {
+        requestCoordinator.finish(ticket);
+        return;
+    }
 
     // Get num_candidates value from input (1-10 range)
-    const numCandidates = parseInt(numCandidatesInput.value, 10);
+    const numCandidates = parseInt(ticket.snapshot.candidateCount, 10);
     const validNumCandidates = (numCandidates && numCandidates >= 1 && numCandidates <= 10) ? numCandidates : 1;
 
     try {
-        const context = contextInput ? contextInput.value : '';
-        const beamSearchType = beamSearchTypeSelect ? beamSearchTypeSelect.value : 'true';
+        const context = ticket.snapshot.context;
+        const beamSearchType = ticket.snapshot.beamSetting;
         const requestBody = {
             hiragana,
             context: context,
             num_candidates: validNumCandidates,
-            model: currentModel,
+            model: ticket.snapshot.model || null,
             beam_search_type: beamSearchType,
         };
 
@@ -308,39 +366,55 @@ async function convertToKanji(hiragana) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(requestBody),
+            signal: ticket.signal,
         });
 
         if (!response.ok) {
             const errorText = await response.text();
-            kanjiCandidates.innerHTML = `<p class="error-text">Error: ${errorText}</p>`;
+            requestCoordinator.commit(ticket, () => {
+                clearDerivedOutput();
+                kanjiCandidates.innerHTML = `<p class="error-text">Error: ${errorText}</p>`;
+            });
             return;
         }
 
         const data = await response.json();
         console.log('API response:', JSON.stringify(data, null, 2));
-        displayKanjiCandidates(data.candidates);
 
-        // Display inference time and model
-        if (data.inference_time_ms !== undefined) {
-            inferenceTime.textContent = `${data.inference_time_ms.toFixed(1)} ms (${data.model}, n=${data.candidates.length})`;
-        }
+        requestCoordinator.commit(ticket, () => {
+            displayKanjiCandidates(data.candidates);
 
-        // Display token visualization for all candidates
-        console.log('Candidate tokens:', data.candidate_tokens);
-        if (data.candidate_tokens && data.candidate_tokens.length > 0) {
-            displayCandidateTokens(data.candidate_tokens, data.beam_search_type);
-        } else if (data.tokens && data.tokens.length > 0) {
-            // Fallback to legacy format
-            displayTokens(data.tokens, data.input_tokens, data.output_tokens);
-        } else {
-            console.log('No tokens, showing placeholder');
-            tokenDisplay.innerHTML = '<p class="placeholder-text">Token data not available</p>';
-            tokenCount.textContent = '';
-        }
+            // Display inference time and model
+            if (data.inference_time_ms !== undefined) {
+                inferenceTime.textContent = `${data.inference_time_ms.toFixed(1)} ms (${data.model}, n=${data.candidates.length})`;
+            }
+
+            // Display token visualization for all candidates
+            console.log('Candidate tokens:', data.candidate_tokens);
+            if (data.candidate_tokens && data.candidate_tokens.length > 0) {
+                displayCandidateTokens(data.candidate_tokens, data.beam_search_type);
+            } else if (data.tokens && data.tokens.length > 0) {
+                // Fallback to legacy format
+                displayTokens(data.tokens, data.input_tokens, data.output_tokens);
+            } else {
+                console.log('No tokens, showing placeholder');
+                tokenDisplay.innerHTML = '<p class="placeholder-text">Token data not available</p>';
+                tokenCount.textContent = '';
+            }
+        });
     } catch (error) {
-        console.error('Kanji conversion error:', error);
-        kanjiCandidates.innerHTML = '<p class="error-text">Kanji conversion unavailable</p>';
+        if (isAbortError(error) || !requestCoordinator.isCurrent(ticket)) return;
+        requestCoordinator.commit(ticket, () => {
+            clearDerivedOutput();
+            kanjiCandidates.innerHTML = '<p class="error-text">Kanji conversion unavailable</p>';
+        });
+    } finally {
+        requestCoordinator.finish(ticket);
     }
+}
+
+function isAbortError(error) {
+    return Boolean(error) && error.name === 'AbortError';
 }
 
 // Display tokens for all candidates with scores
@@ -581,31 +655,34 @@ function showCopyFeedback(element) {
 }
 
 async function clearAll() {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
     romajiInput.value = '';
     directHiraganaInput.value = '';
     if (contextInput) contextInput.value = '';
-    hiraganaOutput.textContent = '';
-    bufferDisplay.textContent = '';
-    kanjiCandidates.innerHTML = '<p class="placeholder-text">Type to see kanji candidates</p>';
-    inferenceTime.textContent = '';
-    if (tokenDisplay) tokenDisplay.innerHTML = '<p class="placeholder-text">Tokens will appear here</p>';
-    if (tokenCount) tokenCount.textContent = '';
+    invalidateRequestState();
+    clearDerivedOutput();
 
-    // Clear character counts
-    updateCharCount(romajiCharCount, 0);
-    updateCharCount(hiraganaCharCount, 0);
-    updateCharCount(directHiraganaCharCount, 0);
-    updateCharCount(kanjiCharCount, 0);
+    const resetTicket = requestCoordinator.begin('reset');
+    let resetIsCurrent = false;
 
     try {
-        await fetch(`${API_BASE}/reset`, { method: 'POST' });
+        await fetch(`${API_BASE}/reset`, { method: 'POST', signal: resetTicket.signal });
+        resetIsCurrent = requestCoordinator.isCurrent(resetTicket);
     } catch (error) {
-        console.error('Error resetting:', error);
+        if (!isAbortError(error) && requestCoordinator.isCurrent(resetTicket)) {
+            console.error('Error resetting:', error);
+        }
+    } finally {
+        requestCoordinator.finish(resetTicket);
     }
+
+    if (!resetIsCurrent) return false;
 
     if (currentMode === 'romaji') {
         romajiInput.focus();
     } else {
         directHiraganaInput.focus();
     }
+    return true;
 }

@@ -17,11 +17,11 @@ impl InputMethodEngine {
 
     /// Common helper for cursor movement: flush romaji, clear live conversion, set new position
     fn move_caret(&mut self, new_pos: usize) -> EngineResult {
+        self.invalidate_async_conversion(false);
         if !self.converters.romaji.buffer().is_empty() {
             self.flush_romaji_to_composed();
             self.converters.romaji.reset();
         }
-        self.live.text.clear();
         self.input_buf.cursor_pos = new_pos;
         self.log_chunk_state("cursor");
         let preedit = self.set_composing_state();
@@ -33,6 +33,7 @@ impl InputMethodEngine {
 
     /// Handle backspace in composing mode
     pub(super) fn backspace_composing(&mut self) -> EngineResult {
+        self.invalidate_async_conversion(false);
         // If romaji buffer is not empty, backspace from buffer (not from composed text)
         if !self.converters.romaji.buffer().is_empty() {
             self.converters.romaji.backspace();
@@ -73,6 +74,7 @@ impl InputMethodEngine {
 
     /// Handle delete key in hiragana mode
     pub(super) fn delete_composing(&mut self) -> EngineResult {
+        self.invalidate_async_conversion(false);
         // If romaji buffer is not empty, don't delete from composed (buffer is at cursor)
         if !self.converters.romaji.buffer().is_empty() {
             return EngineResult::consumed();

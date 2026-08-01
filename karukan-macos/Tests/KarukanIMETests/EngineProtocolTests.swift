@@ -24,7 +24,7 @@ final class EngineProtocolTests: XCTestCase {
 
     func testDecodeShowCandidates() throws {
         let json = """
-            {"consumed":true,"actions":[{"candidates":[{"description":"[全]カタカナ","text":"カ"},{"text":"か"}],"cursor":0,"page":0,"total_pages":3,"type":"show_candidates"}],"conversion_ms":11,"process_key_ms":42}
+            {"consumed":true,"actions":[{"candidates":[{"description":"[全]カタカナ","text":"カ"},{"text":"か"}],"cursor":0,"page":0,"total_pages":3,"type":"show_candidates"}],"conversion_ms":11,"process_key_ms":42,"pending_async":false}
             """
         let result = try decodeKeyResult(json)
         guard
@@ -41,6 +41,7 @@ final class EngineProtocolTests: XCTestCase {
         XCTAssertEqual(page, 0)
         XCTAssertEqual(totalPages, 3)
         XCTAssertEqual(result.conversionMs, 11)
+        XCTAssertEqual(result.pendingAsync, false)
     }
 
     func testDecodeCommitAndHide() throws {
@@ -75,5 +76,42 @@ final class EngineProtocolTests: XCTestCase {
             {"consumed":true,"actions":[{"type":"warp_to_mars"}],"conversion_ms":0,"process_key_ms":0}
             """
         XCTAssertThrowsError(try decodeKeyResult(json))
+    }
+
+    func testCounterCandidatePageIdentitySurvivesDelayedModelCompletion() throws {
+        let json = """
+            {"consumed":true,"actions":[{"candidates":[{"description":"件","text":"10件-09"},{"description":"件","text":"10件-10"}],"cursor":0,"page":1,"total_pages":2,"type":"show_candidates"}],"conversion_ms":20,"process_key_ms":0}
+            """
+        let result = try decodeKeyResult(json)
+        guard
+            case .showCandidates(let candidates, let cursor, let page, let totalPages) =
+                result.actions[0]
+        else {
+            return XCTFail("expected show_candidates")
+        }
+        XCTAssertEqual(candidates.map(\.text), ["10件-09", "10件-10"])
+        XCTAssertEqual(candidates.map(\.description), ["件", "件"])
+        XCTAssertEqual(cursor, 0)
+        XCTAssertEqual(page, 1)
+        XCTAssertEqual(totalPages, 2)
+        XCTAssertEqual(result.conversionMs, 20)
+    }
+
+    func testHomonymousCounterFirstPageOrderSurvivesDelayedModelCompletion() throws {
+        let json = """
+            {"consumed":true,"actions":[{"candidates":[{"text":"10件"},{"text":"10軒"}],"cursor":0,"page":0,"total_pages":2,"type":"show_candidates"}],"conversion_ms":20,"process_key_ms":0}
+            """
+        let result = try decodeKeyResult(json)
+        guard
+            case .showCandidates(let candidates, let cursor, let page, let totalPages) =
+                result.actions[0]
+        else {
+            return XCTFail("expected show_candidates")
+        }
+        XCTAssertEqual(candidates.map(\.text), ["10件", "10軒"])
+        XCTAssertEqual(cursor, 0)
+        XCTAssertEqual(page, 0)
+        XCTAssertEqual(totalPages, 2)
+        XCTAssertEqual(result.conversionMs, 20)
     }
 }

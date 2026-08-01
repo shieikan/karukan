@@ -8,6 +8,7 @@
 #include <fcitx/addonfactory.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/candidatelist.h>
+#include <fcitx-utils/event.h>
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputmethodengine.h>
 #include <fcitx/instance.h>
@@ -57,10 +58,15 @@ public:
     ::KarukanEngine* rustEngine() { return rustEngine_; }
 
 private:
+    friend class KarukanEngine;
+
+    void scheduleCompletionPoll();
+    void cancelCompletionPoll();
+
     KarukanEngine* engine_;
     InputContext* ic_;
     ::KarukanEngine* rustEngine_{nullptr};
-    bool engineInitialized_{false};
+    std::unique_ptr<EventSourceTime> completionPollEvent_;
 };
 
 // Main engine class

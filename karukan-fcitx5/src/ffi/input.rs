@@ -28,6 +28,21 @@ pub extern "C" fn karukan_engine_process_key(
     if result.consumed { 1 } else { 0 }
 }
 
+/// Apply one completed async UI proposal without submitting another key.
+/// Returns 1 when actions were applied, 0 when no completion was ready.
+#[unsafe(no_mangle)]
+pub extern "C" fn karukan_engine_poll_async_conversion(engine: *mut KarukanEngine) -> c_int {
+    let engine = ffi_mut!(engine, 0);
+    engine.clear_flags();
+    let Some(result) = engine.engine.poll_async_conversion() else {
+        engine.sync_timing();
+        return 0;
+    };
+    engine.apply_actions(result.actions);
+    engine.sync_timing();
+    1
+}
+
 /// Reset the engine state
 #[unsafe(no_mangle)]
 pub extern "C" fn karukan_engine_reset(engine: *mut KarukanEngine) {

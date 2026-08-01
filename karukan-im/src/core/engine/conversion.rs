@@ -2,14 +2,35 @@
 //! chunking lives in the sibling `chunk` module.
 
 use std::collections::HashSet;
-use std::time::Instant;
-
-use tracing::debug;
 
 use super::*;
 
 /// Maximum number of learning candidates to show
 const MAX_LEARNING_CANDIDATES: usize = 3;
+
+pub(super) fn is_pure_script_variant(text: &str, reading: &str) -> bool {
+    karukan_engine::is_pure_hiragana(reading)
+        && (text == reading
+            || text == karukan_engine::hiragana_to_katakana(reading)
+            || text
+                == karukan_engine::kana::katakana_to_half_width(
+                    &karukan_engine::hiragana_to_katakana(reading),
+                ))
+}
+
+fn semantic_annotated_candidate_count(candidates: &[AnnotatedCandidate], reading: &str) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| !is_pure_script_variant(&candidate.text, reading))
+        .count()
+}
+
+pub(super) fn semantic_candidate_count(candidates: &[Candidate], reading: &str) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| !is_pure_script_variant(&candidate.text, reading))
+        .count()
+}
 
 /// Mozc-style width/script annotation for a pure-kana candidate, or `None`
 /// if the text mixes scripts or contains kanji/punctuation. Used to label
@@ -67,107 +88,8 @@ impl CandidateBuilder {
 }
 
 impl InputMethodEngine {
-    /// Run kana-kanji conversion for a reading via llama.cpp model.
-    ///
-    /// Determines the conversion strategy (main model, light model, or parallel beam),
-    /// dispatches to the appropriate model(s), measures latency, and records which model was used.
-    ///
-    /// Skips the model entirely when the reading has no hiragana/katakana — the
-    /// model is trained on kana → kanji and hallucinates garbage (e.g. `「` → `w`)
-    /// for symbol- or alphabet-only inputs. Rule-based variants from
-    /// `SymbolRewriter` cover those cases instead.
-    ///
-    /// `api_context` is the left context (lctx) fed to the model. Callers pass
-    /// `truncate_context_for_api()` for a whole-buffer conversion, or — for
-    /// chunked live conversion — the converted text of the preceding chunks.
-    pub(super) fn run_kana_kanji_conversion(
-        &mut self,
-        reading: &str,
-        api_context: &str,
-        num_candidates: usize,
-    ) -> Vec<String> {
-        if !karukan_engine::contains_kana(reading) {
-            return vec![];
-        }
-        let Some(converter) = self.converters.kanji.as_ref() else {
-            return vec![];
-        };
-        let katakana = karukan_engine::hiragana_to_katakana(reading);
-        let main_model_name = converter.model_display_name().to_string();
-
-        let strategy = self.determine_strategy(reading, num_candidates);
-        debug!(
-            "convert: reading=\"{}\" api_context=\"{}\" candidates={} strategy={:?}",
-            reading, api_context, num_candidates, strategy
-        );
-
-        let start = Instant::now();
-
-        let candidates = match &strategy {
-            ConversionStrategy::ParallelBeam { beam_width } => {
-                let Some(light_converter) = self.converters.light_kanji.as_ref() else {
-                    return vec![];
-                };
-                let bw = *beam_width;
-                let (default_top1, light_candidates) = std::thread::scope(|s| {
-                    let h_default = s.spawn(|| {
-                        converter
-                            .convert(&katakana, api_context, 1)
-                            .unwrap_or_default()
-                    });
-                    let h_beam = s.spawn(|| {
-                        light_converter
-                            .convert(&katakana, api_context, bw)
-                            .unwrap_or_default()
-                    });
-                    (
-                        h_default.join().unwrap_or_default(),
-                        h_beam.join().unwrap_or_default(),
-                    )
-                });
-                Self::merge_candidates_dedup(default_top1, light_candidates, bw)
-            }
-            ConversionStrategy::LightModelOnly => {
-                let Some(light_converter) = self.converters.light_kanji.as_ref() else {
-                    return vec![];
-                };
-                light_converter
-                    .convert(&katakana, api_context, 1)
-                    .unwrap_or_default()
-            }
-            ConversionStrategy::MainModelOnly => converter
-                .convert(&katakana, api_context, 1)
-                .unwrap_or_default(),
-            ConversionStrategy::MainModelBeam { beam_width } => converter
-                .convert(&katakana, api_context, *beam_width)
-                .unwrap_or_default(),
-        };
-
-        self.metrics.conversion_ms = start.elapsed().as_millis() as u64;
-        self.update_adaptive_model_flag(&strategy);
-
-        self.metrics.model_name = match &strategy {
-            ConversionStrategy::ParallelBeam { .. } => {
-                let light_name = self
-                    .converters
-                    .light_kanji
-                    .as_ref()
-                    .map(|c| c.model_display_name().to_string())
-                    .unwrap_or_default();
-                format!("{}+{}", main_model_name, light_name)
-            }
-            ConversionStrategy::LightModelOnly => self
-                .converters
-                .light_kanji
-                .as_ref()
-                .map(|c| c.model_display_name().to_string())
-                .unwrap_or(main_model_name),
-            ConversionStrategy::MainModelOnly | ConversionStrategy::MainModelBeam { .. } => {
-                main_model_name
-            }
-        };
-
-        candidates
+    pub(super) fn should_filter_sentence_script_variants(&self, reading: &str) -> bool {
+        self.mode.current() == InputMode::Hiragana && karukan_engine::is_pure_hiragana(reading)
     }
 
     /// Start kanji conversion for the current input buffer.
@@ -181,15 +103,12 @@ impl InputMethodEngine {
     /// `skip_learning` is set by the Tab path to omit learning-cache
     /// candidates (Space/Down keep the default learning-included behavior).
     pub(super) fn start_conversion(&mut self, skip_learning: bool) -> EngineResult {
+        let prev_suggest_text = std::mem::take(&mut self.live.text);
+        self.invalidate_async_conversion(false);
         // Flush any remaining romaji into composed_hiragana
         self.flush_romaji_to_composed();
 
         let reading = self.input_buf.text.clone();
-
-        // Save auto-suggest/live conversion result before clearing state.
-        // This ensures the candidate that was displayed during input is preserved
-        // in the conversion candidate list even if the re-inference uses a different strategy.
-        let prev_suggest_text = std::mem::take(&mut self.live.text);
 
         self.converters.romaji.reset();
         self.input_buf.cursor_pos = 0;
@@ -202,31 +121,54 @@ impl InputMethodEngine {
         let mut candidates =
             self.build_conversion_candidates(&reading, self.config.num_candidates, skip_learning);
 
-        // If the previous auto-suggest result is not in the new candidates, insert it at the top
-        // so it doesn't disappear when the conversion strategy changes.
-        let seen: HashSet<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
-        if !prev_suggest_text.is_empty()
-            && prev_suggest_text != reading
-            && !seen.contains(prev_suggest_text.as_str())
-        {
-            candidates.insert(
-                0,
-                AnnotatedCandidate::new(prev_suggest_text, CandidateSource::Model),
-            );
+        // The displayed live result is the user's current visual choice, so
+        // it must remain the first selected candidate when Space/Down opens
+        // explicit conversion. Reuse an existing candidate when the text is
+        // already present to preserve its source annotation and dedup it;
+        // otherwise insert it as a model candidate at the front.
+        let suppress_prev_script_variant = self.should_filter_sentence_script_variants(&reading)
+            && is_pure_script_variant(&prev_suggest_text, &reading);
+        if !prev_suggest_text.is_empty() && !suppress_prev_script_variant {
+            if let Some(index) = candidates
+                .iter()
+                .position(|candidate| candidate.text == prev_suggest_text)
+            {
+                let candidate = candidates.remove(index);
+                candidates.insert(0, candidate);
+            } else {
+                candidates.insert(
+                    0,
+                    AnnotatedCandidate::new(prev_suggest_text, CandidateSource::Model),
+                );
+            }
         }
 
         if candidates.is_empty() {
-            // No candidates, stay in hiragana mode
+            // Sentence filtering can intentionally remove every synchronous
+            // script fallback. Keep an empty conversion state while the
+            // explicit worker request is pending.
             let preedit = Preedit::with_text_underlined(&reading);
-            self.state = InputState::Composing {
+            self.state = InputState::Conversion {
                 preedit: preedit.clone(),
-                romaji_buffer: String::new(),
+                candidates: CandidateList::default(),
             };
-            return EngineResult::consumed().with_action(EngineAction::UpdatePreedit(preedit));
+            let result = EngineResult::consumed()
+                .with_action(EngineAction::UpdatePreedit(preedit))
+                .with_action(EngineAction::HideCandidates)
+                .with_action(EngineAction::UpdateAuxText(
+                    self.format_aux_conversion_with_page(&reading, None),
+                ));
+            self.submit_async_conversion(
+                async_conversion::AsyncRequestKind::Explicit,
+                skip_learning,
+            );
+            return result;
         }
 
         let candidate_list = Self::to_conversion_candidate_list(candidates, &reading);
-        self.enter_conversion_state(&reading, candidate_list)
+        let result = self.enter_conversion_state(&reading, candidate_list);
+        self.submit_async_conversion(async_conversion::AsyncRequestKind::Explicit, skip_learning);
+        result
     }
 
     /// Map builder output (`AnnotatedCandidate`) to the public
@@ -333,27 +275,17 @@ impl InputMethodEngine {
     pub(super) fn build_conversion_candidates(
         &mut self,
         reading: &str,
-        num_candidates: usize,
+        _num_candidates: usize,
         skip_learning: bool,
     ) -> Vec<AnnotatedCandidate> {
-        // Try to initialize the kanji converter, but don't bail out if it
-        // fails — symbol-only inputs (e.g. `。。。`) don't need the model and
-        // we still want to produce dictionary, rewriter, and fallback candidates.
-        // run_kana_kanji_conversion handles the converter-missing case.
-        if self.converters.kanji.is_none()
-            && let Err(e) = self.init_kanji_converter()
-        {
-            debug!("Failed to initialize kanji converter: {}", e);
-        }
-
-        let api_context = self.truncate_context_for_api();
-        let candidates = self.run_kana_kanji_conversion(reading, &api_context, num_candidates);
-
         let hiragana = reading.to_string();
         let katakana = karukan_engine::hiragana_to_katakana(reading);
 
         // Priority: Learning → User Dictionary → Model → System Dictionary → Fallback
         let mut builder = CandidateBuilder::new();
+        let counter_rewriter_variants = karukan_engine::rewriter::NumberRewriter::new()
+            .decimal_counter_surfaces(reading)
+            .unwrap_or_default();
 
         // 1. Learning cache candidates (highest priority).
         //    Force-inserted so they win against duplicate text from later sources.
@@ -369,6 +301,14 @@ impl InputMethodEngine {
             }
         }
 
+        // Counter surfaces are a deliberate exception to ordinary dictionary
+        // priority: the closed-table order (10件, then 10軒) must stay visible
+        // on page one even when an exact user dictionary entry has many
+        // surfaces. Non-counter dictionary ordering remains unchanged below.
+        for variant in counter_rewriter_variants {
+            builder.push(AnnotatedCandidate::new(variant, CandidateSource::Rewriter));
+        }
+
         // 2. Dictionary candidates (user dict first, then system dict)
         let dict_results = self.search_dictionaries(reading, usize::MAX);
         // Insert user dictionary entries at the top (after learning)
@@ -378,22 +318,16 @@ impl InputMethodEngine {
             }
         }
 
-        // 3. Model inference results
-        if candidates.is_empty() {
-            // In emoji mode, defer the literal-fallback decision until
-            // after rewriters have run — otherwise `:smile` would be
-            // pinned to the top of the candidate list as a Fallback
-            // and outrank the 😄 we surface in step 5/6.
-            if builder.is_empty() && self.mode.current() != InputMode::Emoji {
-                builder.push(AnnotatedCandidate::new(
-                    hiragana.clone(),
-                    CandidateSource::Fallback,
-                ));
-            }
-        } else {
-            for text in candidates {
-                builder.push(AnnotatedCandidate::new(text, CandidateSource::Model));
-            }
+        // 3. Model inference proposals are appended by the worker poll path.
+        // Keep a synchronous reading fallback available for explicit conversion
+        // so the handler always has a selected candidate immediately.
+        let filter_script_variants = self.should_filter_sentence_script_variants(reading);
+        if builder.is_empty() && self.mode.current() != InputMode::Emoji && !filter_script_variants
+        {
+            builder.push(AnnotatedCandidate::new(
+                hiragana.clone(),
+                CandidateSource::Fallback,
+            ));
         }
 
         // 4. System dictionary candidates (from search_dictionaries result)
@@ -420,6 +354,24 @@ impl InputMethodEngine {
             .rewrite_all(&[reading.to_string()]);
         if self.mode.current() == InputMode::Emoji {
             for (variant, description) in rewriter_variants {
+                builder.push(
+                    AnnotatedCandidate::new(variant, CandidateSource::Rewriter)
+                        .with_description(description),
+                );
+            }
+        } else if filter_script_variants {
+            // In ordinary Hiragana explicit conversion, the raw reading is
+            // not a useful conversion candidate. Complete full/half-width
+            // Katakana renderings are also noise until a full page of
+            // semantic candidates exists; if it does, append them after that
+            // page so 1-9 remain meaningful conversion choices.
+            let has_semantic_page =
+                semantic_annotated_candidate_count(&builder.candidates, reading)
+                    >= CandidateList::DEFAULT_PAGE_SIZE;
+            for (variant, description) in rewriter_variants {
+                if is_pure_script_variant(&variant, reading) && !has_semantic_page {
+                    continue;
+                }
                 builder.push(
                     AnnotatedCandidate::new(variant, CandidateSource::Rewriter)
                         .with_description(description),
@@ -472,12 +424,33 @@ impl InputMethodEngine {
             }
         }
 
+        if filter_script_variants {
+            let mut semantic = Vec::new();
+            let mut script_variants = Vec::new();
+            for candidate in std::mem::take(&mut builder.candidates) {
+                if candidate.text == reading {
+                    continue;
+                }
+                if is_pure_script_variant(&candidate.text, reading) {
+                    script_variants.push(candidate);
+                } else {
+                    semantic.push(candidate);
+                }
+            }
+            if semantic.len() >= CandidateList::DEFAULT_PAGE_SIZE {
+                semantic.extend(script_variants);
+            }
+            builder.candidates = semantic;
+        }
+
         builder.into_candidates()
     }
 
-    /// Look up learning cache candidates for a reading (exact + prefix match, max 3).
+    /// Look up learning cache candidates for a completed reading (max 3).
     ///
-    /// Returns candidates from the learning cache suitable for auto-suggest display.
+    /// Returns candidates from the exact reading suitable for both auto-suggest
+    /// and explicit Space conversion. The cache's public prefix lookup remains
+    /// available to callers that explicitly need predictive results.
     pub(super) fn lookup_learning_candidates(&self, reading: &str) -> Vec<Candidate> {
         let Some(cache) = &self.learning else {
             return vec![];
@@ -485,7 +458,8 @@ impl InputMethodEngine {
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut seen = HashSet::new();
 
-        // Exact match
+        // Exact match only: a partially typed reading must not surface a
+        // learned result for a longer, uncompleted reading.
         for (surface, _score) in cache.lookup(reading) {
             if candidates.len() >= MAX_LEARNING_CANDIDATES {
                 break;
@@ -494,24 +468,6 @@ impl InputMethodEngine {
                 candidates.push(Candidate {
                     text: surface,
                     reading: Some(reading.to_string()),
-                    source: Some(CandidateSource::Learning),
-                    description: None,
-                });
-            }
-        }
-
-        // Prefix match (predictive)
-        for (full_reading, surface, _score) in cache.prefix_lookup(reading) {
-            if candidates.len() >= MAX_LEARNING_CANDIDATES {
-                break;
-            }
-            if full_reading == reading {
-                continue;
-            }
-            if seen.insert(surface.clone()) {
-                candidates.push(Candidate {
-                    text: surface,
-                    reading: Some(full_reading),
                     source: Some(CandidateSource::Learning),
                     description: None,
                 });
@@ -664,11 +620,12 @@ impl InputMethodEngine {
         };
 
         if text.is_empty() {
+            self.invalidate_async_conversion(true);
             return EngineResult::consumed();
         }
 
+        self.invalidate_async_conversion(true);
         self.finish_conversion(&text, &reading);
-
         EngineResult::consumed()
             .with_action(EngineAction::HideCandidates)
             .with_action(EngineAction::HideAuxText)
@@ -681,8 +638,8 @@ impl InputMethodEngine {
             return EngineResult::not_consumed();
         };
 
+        self.invalidate_async_conversion(true);
         self.finish_conversion(&text, &reading);
-
         // Start new input with the character
         let new_input_result = self.start_input(ch);
 
@@ -750,6 +707,7 @@ impl InputMethodEngine {
         if !matches!(self.state, InputState::Conversion { .. }) {
             return EngineResult::not_consumed();
         }
+        self.invalidate_async_conversion(true);
         let reading = self.input_buf.text.clone();
 
         if reading.is_empty() {
@@ -782,6 +740,7 @@ impl InputMethodEngine {
 
     /// Navigate candidates with the given operation, then update preedit
     fn navigate_candidate(&mut self, op: impl FnOnce(&mut CandidateList) -> bool) -> EngineResult {
+        self.invalidate_async_conversion(false);
         let (selected_text, candidates) = {
             let Some(candidates) = self.state.candidates_mut() else {
                 return EngineResult::not_consumed();
@@ -817,15 +776,25 @@ impl InputMethodEngine {
     /// current page, like pressing the digit key `page_index + 1`. Not
     /// consumed unless a candidate list is active (Conversion state).
     pub fn select_candidate_on_page(&mut self, page_index: usize) -> EngineResult {
+        self.poll_init_assets();
         let start = std::time::Instant::now();
         self.metrics.conversion_ms = 0;
-        let result = self.select_candidate_by_digit(page_index + 1);
+        let mut result = self
+            .poll_async_conversion()
+            .unwrap_or_else(EngineResult::not_consumed);
+        let selection_result = self.select_candidate_by_digit(page_index + 1);
+        result.actions.extend(selection_result.actions);
+        result.consumed = selection_result.consumed;
         self.metrics.process_key_ms = start.elapsed().as_millis() as u64;
         result
     }
 
     /// Select candidate by digit (1-9)
     fn select_candidate_by_digit(&mut self, digit: usize) -> EngineResult {
+        if self.state.candidates().is_none() {
+            return EngineResult::not_consumed();
+        }
+        self.invalidate_async_conversion(true);
         let (selected_text, reading) = {
             let candidates = match self.state.candidates_mut() {
                 Some(c) => c,
