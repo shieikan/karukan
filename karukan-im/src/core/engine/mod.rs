@@ -567,18 +567,18 @@ impl InputMethodEngine {
 
         let shift_active = key.modifiers.shift_key;
 
-        // Consume a completed worker proposal before the key handler mutates
-        // generation, input, selection, or page state. A completion that is
-        // already ready belongs to the previous snapshot; polling after the
-        // key handler would invalidate and discard it on every host boundary.
-        let mut result = self
-            .poll_async_conversion()
-            .unwrap_or_else(EngineResult::not_consumed);
         let key_result = match &self.state {
             InputState::Empty => self.process_key_empty(key, shift_active),
             InputState::Composing { .. } => self.process_key_composing(key, shift_active),
             InputState::Conversion { .. } => self.process_key_conversion(key),
         };
+        // Poll only after the key handler has finished. A key that changes the
+        // input/state invalidates the old ready completion before this poll;
+        // pass-through keys leave the snapshot unchanged and can still apply
+        // its UI actions without changing the key's consumed status.
+        let mut result = self
+            .poll_async_conversion()
+            .unwrap_or_else(EngineResult::not_consumed);
         result.actions.extend(key_result.actions);
         // Completion UI updates are not input events. Only the current key
         // operation decides whether this boundary consumes the key.

@@ -132,6 +132,56 @@ fn test_last_chunk_may_be_shorter_than_n() {
     assert_eq!(readings, vec!["あい", "う"]);
 }
 
+#[test]
+fn fresh_short_tail_append_keeps_stable_prefix_and_dirties_only_new_tail() {
+    let mut engine = make_chunk_engine(2);
+    engine.input_buf.insert("あいう");
+    engine.chunked_auto_suggest();
+    engine.chunks[0].converted = "愛".to_string();
+    engine.chunks[0].fresh = true;
+    engine.chunks[1].converted = "有".to_string();
+    engine.chunks[1].fresh = true;
+
+    engine.input_buf.insert("え");
+    engine.chunked_auto_suggest();
+
+    assert_eq!(
+        engine
+            .chunks
+            .iter()
+            .map(|chunk| (
+                chunk.reading.as_str(),
+                chunk.converted.as_str(),
+                chunk.fresh
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("あい", "愛", true),
+            ("う", "有", true),
+            ("え", "え", false)
+        ]
+    );
+}
+
+#[test]
+fn nonfresh_short_tail_append_can_still_grow() {
+    let mut engine = make_chunk_engine(2);
+    engine.input_buf.insert("あいう");
+    engine.chunked_auto_suggest();
+
+    engine.input_buf.insert("え");
+    engine.chunked_auto_suggest();
+
+    assert_eq!(
+        engine
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.reading.as_str(), chunk.fresh))
+            .collect::<Vec<_>>(),
+        vec![("あい", false), ("うえ", false)]
+    );
+}
+
 /// Tail of `s` limited to `budget` chars (mirrors `truncate_context`).
 fn ctx_tail(s: &str, budget: usize) -> String {
     let chars: Vec<char> = s.chars().collect();

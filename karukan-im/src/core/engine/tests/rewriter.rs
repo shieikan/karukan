@@ -108,21 +108,61 @@ fn assert_not_contains(texts: &[String], forbidden: &str) {
 // ---------- half-width katakana variants ----------
 
 #[test]
-fn single_hiragana_emits_half_width_katakana() {
-    assert_contains(&conversion_texts("あ"), "ｱ");
+fn single_hiragana_hides_half_width_katakana_without_a_semantic_page() {
+    assert_not_contains(&conversion_texts("あ"), "ｱ");
 }
 
 #[test]
-fn hiragana_word_emits_half_width_katakana() {
-    assert_contains(&conversion_texts("がっこう"), "ｶﾞｯｺｳ");
+fn hiragana_word_hides_half_width_katakana_without_a_semantic_page() {
+    assert_not_contains(&conversion_texts("がっこう"), "ｶﾞｯｺｳ");
 }
 
 #[test]
-fn short_word_keeps_all_script_variants_for_explicit_conversion() {
+fn short_word_hides_pure_script_variants_without_a_semantic_page() {
     let texts = conversion_texts("がっこう");
-    assert_contains(&texts, "がっこう");
-    assert_contains(&texts, "ガッコウ");
-    assert_contains(&texts, "ｶﾞｯｺｳ");
+    assert_not_contains(&texts, "がっこう");
+    assert_not_contains(&texts, "ガッコウ");
+    assert_not_contains(&texts, "ｶﾞｯｺｳ");
+}
+
+#[test]
+fn pure_script_variants_follow_a_full_semantic_page() {
+    let mut engine = composing_engine("がっこう");
+    engine.dicts.user = Some(user_dict_with_surfaces(
+        "がっこう",
+        &[
+            "ガッコウ",
+            "学校00",
+            "学校01",
+            "学校02",
+            "学校03",
+            "学校04",
+            "学校05",
+            "学校06",
+            "学校07",
+            "学校08",
+        ],
+    ));
+    let candidates = engine.build_conversion_candidates("がっこう", 9, false);
+    let texts: Vec<&str> = candidates
+        .iter()
+        .map(|candidate| candidate.text.as_str())
+        .collect();
+
+    assert_not_contains(
+        &texts
+            .iter()
+            .map(|text| (*text).to_string())
+            .collect::<Vec<_>>(),
+        "がっこう",
+    );
+    for variant in ["ガッコウ", "ｶﾞｯｺｳ"] {
+        let index = texts
+            .iter()
+            .position(|text| *text == variant)
+            .unwrap_or_else(|| panic!("missing {variant}: {texts:?}"));
+        assert!(index >= 9, "{variant} must start after page one: {texts:?}");
+    }
 }
 
 #[test]
@@ -211,7 +251,7 @@ fn host_commit_during_pending_sentence_conversion_preserves_raw_reading() {
 }
 
 #[test]
-fn long_dictionary_word_keeps_script_variants() {
+fn long_dictionary_word_hides_script_variants_without_a_semantic_page() {
     let mut engine = composing_engine("とうきょうと");
     engine.dicts.user = Some(user_dict_with("とうきょうと", "東京都"));
     let texts: Vec<String> = engine
@@ -220,9 +260,10 @@ fn long_dictionary_word_keeps_script_variants() {
         .map(|candidate| candidate.text)
         .collect();
 
-    assert_contains(&texts, "とうきょうと");
-    assert_contains(&texts, "トウキョウト");
-    assert_contains(&texts, "ﾄｳｷｮｳﾄ");
+    assert_contains(&texts, "東京都");
+    assert_not_contains(&texts, "とうきょうと");
+    assert_not_contains(&texts, "トウキョウト");
+    assert_not_contains(&texts, "ﾄｳｷｮｳﾄ");
 }
 
 #[test]
@@ -380,19 +421,19 @@ fn kagikakko_reading_emits_paired_brackets_in_conversion() {
 }
 
 #[test]
-fn katakana_variants_carry_width_form_description() {
+fn katakana_variants_after_a_semantic_page_carry_width_form_description() {
     // mozc-style width annotation: full-width katakana → `[全]カタカナ`,
     // half-width katakana → `[半]カタカナ`. The hiragana fallback also picks
     // up `[全]ひらがな` since hiragana is intrinsically full-width.
     let mut engine = composing_engine("あ");
+    engine.dicts.user = Some(user_dict_with_surfaces(
+        "あ",
+        &[
+            "意味00", "意味01", "意味02", "意味03", "意味04", "意味05", "意味06", "意味07",
+            "意味08",
+        ],
+    ));
     let candidates = engine.build_conversion_candidates("あ", 9, false);
-
-    let hira = candidates.iter().find(|c| c.text == "あ").unwrap();
-    assert_eq!(
-        hira.description.as_deref(),
-        Some("[全]ひらがな"),
-        "hiragana fallback `あ` should be annotated as `[全]ひらがな`",
-    );
 
     let full = candidates.iter().find(|c| c.text == "ア").unwrap();
     assert_eq!(
@@ -428,13 +469,13 @@ fn typing_three_dots_emits_ellipsis_in_auto_suggest_and_conversion() {
 }
 
 #[test]
-fn typing_a_then_space_emits_half_width_katakana() {
+fn typing_a_then_space_hides_half_width_katakana_without_a_semantic_page() {
     let mut engine = InputMethodEngine::new();
     type_string(&mut engine, "a");
 
     let result = engine.process_key(&press_key(Keysym::SPACE));
     assert!(result.consumed);
-    assert_contains(&conversion_state_texts(&engine), "ｱ");
+    assert_not_contains(&conversion_state_texts(&engine), "ｱ");
 }
 
 #[test]

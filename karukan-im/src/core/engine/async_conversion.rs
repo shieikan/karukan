@@ -886,11 +886,16 @@ impl super::InputMethodEngine {
         let mut candidates = current.candidates().to_vec();
         let filter_script_variants =
             self.should_filter_sentence_script_variants(&completion.snapshot.reading);
+        let mut deferred_script_variants = Vec::new();
         for text in completion.model_candidates {
-            if filter_script_variants
-                && super::conversion::is_pure_script_variant(&text, &completion.snapshot.reading)
-            {
-                continue;
+            if filter_script_variants {
+                if text == completion.snapshot.reading {
+                    continue;
+                }
+                if super::conversion::is_pure_script_variant(&text, &completion.snapshot.reading) {
+                    deferred_script_variants.push(text);
+                    continue;
+                }
             }
             if !candidates.iter().any(|candidate| candidate.text == text) {
                 candidates.push(super::Candidate {
@@ -900,6 +905,59 @@ impl super::InputMethodEngine {
                     description: None,
                 });
             }
+        }
+        if filter_script_variants
+            && super::conversion::semantic_candidate_count(
+                &candidates,
+                &completion.snapshot.reading,
+            ) >= super::CandidateList::DEFAULT_PAGE_SIZE
+        {
+            // A model completion can turn a short synchronous list into a
+            // full semantic page. Only then release the deferred model script
+            // variants and add any rule-based variants that were suppressed
+            // before the model result arrived.
+            for text in deferred_script_variants {
+                if !candidates.iter().any(|candidate| candidate.text == text) {
+                    candidates.push(super::Candidate {
+                        text,
+                        reading: Some(completion.snapshot.reading.clone()),
+                        source_label: Some(super::CandidateSource::Model.label().to_string()),
+                        description: None,
+                    });
+                }
+            }
+            for candidate in self.lookup_rewriter_variants(&completion.snapshot.reading) {
+                if super::conversion::is_pure_script_variant(
+                    &candidate.text,
+                    &completion.snapshot.reading,
+                ) && !candidates
+                    .iter()
+                    .any(|existing| existing.text == candidate.text)
+                {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        if filter_script_variants {
+            let mut semantic = Vec::new();
+            let mut script_variants = Vec::new();
+            for candidate in candidates {
+                if candidate.text == completion.snapshot.reading {
+                    continue;
+                }
+                if super::conversion::is_pure_script_variant(
+                    &candidate.text,
+                    &completion.snapshot.reading,
+                ) {
+                    script_variants.push(candidate);
+                } else {
+                    semantic.push(candidate);
+                }
+            }
+            if semantic.len() >= super::CandidateList::DEFAULT_PAGE_SIZE {
+                semantic.extend(script_variants);
+            }
+            candidates = semantic;
         }
         let mut updated = super::CandidateList::new(candidates);
         if updated.is_empty() {

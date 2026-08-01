@@ -27,8 +27,9 @@ fn test_live_text_preserved_in_conversion_via_down() {
 }
 
 #[test]
-fn test_live_text_not_duplicated_in_conversion() {
-    // If the live_text matches the reading, it should not be duplicated
+fn test_live_text_matching_hiragana_is_hidden_in_conversion() {
+    // A live text that matches the raw reading must not reintroduce the raw
+    // Hiragana candidate in ordinary Hiragana explicit conversion.
     let mut engine = make_live_conversion_engine();
 
     engine.process_key(&press('a'));
@@ -40,16 +41,14 @@ fn test_live_text_not_duplicated_in_conversion() {
     assert!(result.consumed);
     assert!(matches!(engine.state(), InputState::Conversion { .. }));
 
-    // "あい" should not appear twice (it's same as reading, so live_text is skipped)
+    // "あい" is hidden rather than duplicated.
     let candidates = engine.state().candidates().unwrap();
     let count = candidates
         .candidates()
         .iter()
         .filter(|c| c.text == "あい")
         .count();
-    assert_eq!(count, 1, "Reading should appear exactly once");
-    assert_eq!(candidates.cursor(), 0);
-    assert_eq!(candidates.selected().unwrap().source_label.as_deref(), None);
+    assert_eq!(count, 0, "raw Hiragana should be hidden");
 }
 
 #[test]
@@ -92,7 +91,12 @@ fn test_live_conversion_is_first_selected_candidate_on_space() {
         .iter()
         .map(|candidate| candidate.text.as_str())
         .collect();
-    assert_eq!(&texts[..3], ["愛", "あい", "アイ"]);
+    assert_eq!(texts.first().copied(), Some("愛"));
+    assert!(
+        !texts
+            .iter()
+            .any(|text| matches!(*text, "あい" | "アイ" | "ｱｲ"))
+    );
     assert_eq!(candidates.cursor(), 0);
     assert_eq!(candidates.selected().unwrap().text, "愛");
     assert_eq!(

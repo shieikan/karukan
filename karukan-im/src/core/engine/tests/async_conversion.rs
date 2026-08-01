@@ -426,7 +426,7 @@ fn conversion_mailbox_is_capacity_one_latest_wins() {
 }
 
 #[test]
-fn ready_completion_is_applied_before_next_key_invalidates_it() {
+fn ready_completion_is_discarded_when_next_key_changes_input() {
     let gate = Arc::new(SynchronizedGate {
         started_calls: AtomicUsize::new(0),
         released_calls: AtomicUsize::new(0),
@@ -448,19 +448,19 @@ fn ready_completion_is_applied_before_next_key_invalidates_it() {
     });
 
     // The latest completion is ready before this key mutates the input. The
-    // host boundary must consume it first instead of invalidating it.
+    // key handler must invalidate the old snapshot before the post-key poll.
     let result = engine.process_key(&press('u'));
     assert!(
-        result
-            .actions
-            .iter()
-            .any(|action| matches!(action, EngineAction::HideCandidates)),
-        "live completion should keep candidates hidden: {:?}",
+        !result.actions.iter().any(|action| {
+            matches!(
+                action,
+                EngineAction::UpdatePreedit(preedit) if preedit.text().contains("converted:アイ")
+            )
+        }),
+        "the old completion must not be applied after input changed: {:?}",
         result.actions
     );
-    assert!(result.actions.iter().any(|action| {
-        matches!(action, EngineAction::UpdatePreedit(preedit) if preedit.text().contains("converted:アイ"))
-    }));
+    assert_eq!(engine.input_buf.text, "あいう");
 }
 
 #[test]
@@ -509,6 +509,13 @@ fn candidate_texts(engine: &InputMethodEngine) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn assert_not_contains(texts: &[String], forbidden: &str) {
+    assert!(
+        !texts.iter().any(|text| text == forbidden),
+        "`{forbidden}` should not be present: {texts:?}"
+    );
 }
 
 fn type_counter(engine: &mut InputMethodEngine) {
@@ -1343,6 +1350,50 @@ fn explicit_completion_deduplicates_model_text_without_reordering_sync_candidate
         candidate_texts(&engine),
         vec!["sync-first", "sync-second", "model-only"]
     );
+}
+
+#[test]
+fn async_explicit_hiragana_filters_script_variants_without_a_semantic_page() {
+    let mut engine = explicit_completion_engine(vec![
+        "model-only".to_string(),
+        "あ".to_string(),
+        "ア".to_string(),
+        "ｱ".to_string(),
+    ]);
+    engine.submit_async_conversion(
+        crate::core::engine::async_conversion::AsyncRequestKind::Explicit,
+        false,
+    );
+    let _ = wait_for_engine_completion(&mut engine);
+
+    let texts = candidate_texts(&engine);
+    assert_not_contains(&texts, "あ");
+    assert_not_contains(&texts, "ア");
+    assert_not_contains(&texts, "ｱ");
+}
+
+#[test]
+fn async_explicit_hiragana_places_script_variants_after_a_semantic_page() {
+    let mut model_candidates = (0..8)
+        .map(|index| format!("model-{index}"))
+        .collect::<Vec<_>>();
+    model_candidates.extend(["あ".to_string(), "ア".to_string(), "ｱ".to_string()]);
+    let mut engine = explicit_completion_engine(model_candidates);
+    engine.submit_async_conversion(
+        crate::core::engine::async_conversion::AsyncRequestKind::Explicit,
+        false,
+    );
+    let _ = wait_for_engine_completion(&mut engine);
+
+    let texts = candidate_texts(&engine);
+    assert_not_contains(&texts, "あ");
+    for variant in ["ア", "ｱ"] {
+        let index = texts
+            .iter()
+            .position(|text| text == variant)
+            .unwrap_or_else(|| panic!("missing {variant}: {texts:?}"));
+        assert!(index >= 9, "{variant} must start after page one: {texts:?}");
+    }
 }
 
 #[test]

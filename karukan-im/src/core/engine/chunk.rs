@@ -107,7 +107,14 @@ struct ChunkPlan {
 impl ChunkPlan {
     /// Diff `old_text` (the concatenated readings of the previous chunks,
     /// whose individual char lengths are `old_lens`) against the new `text`.
-    fn compute(old_lens: &[usize], old_text: &[char], text: &[char], chunk_len: usize) -> Self {
+    fn compute(
+        old_lens: &[usize],
+        old_fresh: &[bool],
+        old_text: &[char],
+        text: &[char],
+        chunk_len: usize,
+    ) -> Self {
+        debug_assert_eq!(old_lens.len(), old_fresh.len());
         let cp = common_prefix_len(old_text, text);
         let cs = common_suffix_len(old_text, text, cp);
 
@@ -128,6 +135,7 @@ impl ChunkPlan {
             && lead_chars == cp
             && cp < text.len()
             && old_lens[lead_count - 1] < chunk_len
+            && !old_fresh[lead_count - 1]
             && same_group(old_text[lead_chars - 1], text[cp])
         {
             lead_count -= 1;
@@ -191,9 +199,10 @@ impl InputMethodEngine {
         // model calls below don't conflict with borrowing `self.chunks`.
         let mut old = std::mem::take(&mut self.chunks);
         let old_lens: Vec<usize> = old.iter().map(|s| s.reading.chars().count()).collect();
+        let old_fresh: Vec<bool> = old.iter().map(|s| s.fresh).collect();
         let old_text: Vec<char> = old.iter().flat_map(|s| s.reading.chars()).collect();
 
-        let plan = ChunkPlan::compute(&old_lens, &old_text, &text, chunk_len);
+        let plan = ChunkPlan::compute(&old_lens, &old_fresh, &old_text, &text, chunk_len);
 
         let mut chunks: Vec<ComposingChunk> = Vec::with_capacity(old.len() + 1);
         let mut combined = String::new();
@@ -423,7 +432,22 @@ mod plan_tests {
             old_lens.iter().sum::<usize>(),
             "old_lens vs old_text"
         );
-        ChunkPlan::compute(old_lens, &old, &new, chunk_len)
+        let old_fresh = vec![false; old_lens.len()];
+        ChunkPlan::compute(old_lens, &old_fresh, &old, &new, chunk_len)
+    }
+
+    fn plan_with_fresh(
+        old_lens: &[usize],
+        old_fresh: &[bool],
+        old_text: &str,
+        new_text: &str,
+        chunk_len: usize,
+    ) -> ChunkPlan {
+        let old: Vec<char> = old_text.chars().collect();
+        let new: Vec<char> = new_text.chars().collect();
+        assert_eq!(old.len(), old_lens.iter().sum::<usize>());
+        assert_eq!(old_lens.len(), old_fresh.len());
+        ChunkPlan::compute(old_lens, old_fresh, &old, &new, chunk_len)
     }
 
     #[test]
@@ -466,6 +490,21 @@ mod plan_tests {
                 lead_count: 1,
                 trail_count: 0,
                 mid_start: 2,
+                mid_end: 4
+            }
+        );
+    }
+
+    #[test]
+    fn append_after_fresh_nonfull_chunk_keeps_stable_prefix() {
+        // [ab][c] + "d": a fresh short tail is stable; only the new tail is dirty.
+        let p = plan_with_fresh(&[2, 1], &[true, true], "abc", "abcd", 2);
+        assert_eq!(
+            p,
+            ChunkPlan {
+                lead_count: 2,
+                trail_count: 0,
+                mid_start: 3,
                 mid_end: 4
             }
         );

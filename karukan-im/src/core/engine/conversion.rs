@@ -7,31 +7,26 @@ use super::*;
 
 /// Maximum number of learning candidates to show
 const MAX_LEARNING_CANDIDATES: usize = 3;
-const SENTENCE_LIKE_READING_MIN_CHARS: usize = 8;
-
-/// Treat long readings or readings containing a sentence separator as
-/// sentence-like. A short word such as `がっこう` stays eligible for the
-/// explicit script variants, while phrase-sized input does not get a page of
-/// candidates that merely restates the same reading in three scripts.
-fn is_sentence_like_reading(reading: &str, has_exact_dictionary_entry: bool) -> bool {
-    let has_separator = reading.chars().any(|c| {
-        matches!(
-            c,
-            ' ' | '\u{3000}' | '、' | '。' | '，' | '．' | '！' | '？' | '!' | '?'
-        )
-    });
-
-    has_separator
-        || (karukan_engine::is_pure_hiragana(reading)
-            && reading.chars().count() >= SENTENCE_LIKE_READING_MIN_CHARS
-            && !has_exact_dictionary_entry)
-}
 
 pub(super) fn is_pure_script_variant(text: &str, reading: &str) -> bool {
     karukan_engine::is_pure_hiragana(reading)
         && (text == reading
             || text == karukan_engine::hiragana_to_katakana(reading)
             || text == karukan_engine::kana::hiragana_to_half_katakana(reading))
+}
+
+fn semantic_annotated_candidate_count(candidates: &[AnnotatedCandidate], reading: &str) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| !is_pure_script_variant(&candidate.text, reading))
+        .count()
+}
+
+pub(super) fn semantic_candidate_count(candidates: &[Candidate], reading: &str) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| !is_pure_script_variant(&candidate.text, reading))
+        .count()
 }
 
 /// Mozc-style width/script annotation for a pure-kana candidate, or `None`
@@ -91,8 +86,7 @@ impl CandidateBuilder {
 
 impl InputMethodEngine {
     pub(super) fn should_filter_sentence_script_variants(&self, reading: &str) -> bool {
-        self.input_mode != InputMode::Katakana
-            && is_sentence_like_reading(reading, !self.search_dictionaries(reading, 1).is_empty())
+        self.input_mode == InputMode::Hiragana && karukan_engine::is_pure_hiragana(reading)
     }
 
     /// Start kanji conversion for the current input buffer.
@@ -322,7 +316,6 @@ impl InputMethodEngine {
 
         // 2. Dictionary candidates (user dict first, then system dict)
         let dict_results = self.search_dictionaries(reading, usize::MAX);
-        let has_exact_dictionary_entry = !dict_results.is_empty();
         // Insert user dictionary entries at the top (after learning)
         for ac in &dict_results {
             if ac.source == CandidateSource::UserDictionary {
@@ -333,7 +326,8 @@ impl InputMethodEngine {
         // 3. Model inference proposals are appended by the worker poll path.
         // Keep a synchronous reading fallback available for explicit conversion
         // so the handler always has a selected candidate immediately.
-        if builder.is_empty() && self.input_mode != InputMode::Emoji {
+        let filter_script_variants = self.should_filter_sentence_script_variants(reading);
+        if builder.is_empty() && self.input_mode != InputMode::Emoji && !filter_script_variants {
             builder.push(AnnotatedCandidate::new(
                 hiragana.clone(),
                 CandidateSource::Fallback,
@@ -360,6 +354,24 @@ impl InputMethodEngine {
         // behavior is untouched.
         if self.input_mode == InputMode::Emoji {
             for (variant, description) in rewriter_variants {
+                builder.push(
+                    AnnotatedCandidate::new(variant, CandidateSource::Rewriter)
+                        .with_description(description),
+                );
+            }
+        } else if filter_script_variants {
+            // In ordinary Hiragana explicit conversion, the raw reading is
+            // not a useful conversion candidate. Complete full/half-width
+            // Katakana renderings are also noise until a full page of
+            // semantic candidates exists; if it does, append them after that
+            // page so 1-9 remain meaningful conversion choices.
+            let has_semantic_page =
+                semantic_annotated_candidate_count(&builder.candidates, reading)
+                    >= CandidateList::DEFAULT_PAGE_SIZE;
+            for (variant, description) in rewriter_variants {
+                if is_pure_script_variant(&variant, reading) && !has_semantic_page {
+                    continue;
+                }
                 builder.push(
                     AnnotatedCandidate::new(variant, CandidateSource::Rewriter)
                         .with_description(description),
@@ -412,16 +424,23 @@ impl InputMethodEngine {
             }
         }
 
-        // In a sentence-like explicit conversion, the three pure-script
-        // renderings are noise rather than useful alternatives. Keep this
-        // disabled in Katakana mode so Ctrl+K remains an explicit path to a
-        // katakana preedit and commit.
-        if self.input_mode != InputMode::Katakana
-            && is_sentence_like_reading(reading, has_exact_dictionary_entry)
-        {
-            builder
-                .candidates
-                .retain(|candidate| !is_pure_script_variant(&candidate.text, reading));
+        if filter_script_variants {
+            let mut semantic = Vec::new();
+            let mut script_variants = Vec::new();
+            for candidate in std::mem::take(&mut builder.candidates) {
+                if candidate.text == reading {
+                    continue;
+                }
+                if is_pure_script_variant(&candidate.text, reading) {
+                    script_variants.push(candidate);
+                } else {
+                    semantic.push(candidate);
+                }
+            }
+            if semantic.len() >= CandidateList::DEFAULT_PAGE_SIZE {
+                semantic.extend(script_variants);
+            }
+            builder.candidates = semantic;
         }
 
         builder.into_candidates()
