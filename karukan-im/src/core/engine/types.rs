@@ -1,6 +1,6 @@
 //! Type definitions for the IME engine
 
-use karukan_engine::{Dictionary, KanaKanjiConverter, RewriterChain, RomajiConverter};
+use karukan_engine::{Dictionary, RewriterChain, RomajiConverter};
 
 use crate::config::settings::StrategyMode;
 
@@ -128,23 +128,43 @@ impl Default for EngineConfig {
     }
 }
 
-/// Converter bundle: romaji → hiragana, kana → kanji (main + light)
+/// Token-count display value returned by the worker.
+///
+/// This compatibility proxy deliberately has no model or backend ownership.
+/// The legacy display helper still asks the `kanji` slot for a token count,
+/// while the actual count is populated only from a worker proposal.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::core) struct CompatibilityTokenCounter {
+    pub token_count: usize,
+}
+
+impl CompatibilityTokenCounter {
+    pub fn count_input_tokens(&self, _reading: &str) -> Result<usize, ()> {
+        Ok(self.token_count)
+    }
+}
+
+/// Converter bundle for handler-owned, non-model conversion state.
+///
+/// The kanji slots are token-count-only compatibility fields for existing
+/// internal tests and callers; production initialization never creates models
+/// here. All model ownership is in [`super::async_conversion::AsyncConversionWorker`].
 pub(in crate::core) struct Converters {
     /// Romaji to hiragana converter
     pub romaji: RomajiConverter,
-    /// Kanji converter (lazy loaded)
-    pub kanji: Option<KanaKanjiConverter>,
-    /// Light model for beam search
-    pub light_kanji: Option<KanaKanjiConverter>,
+    /// Worker-proposed token count for the legacy display helper
+    pub kanji: Option<CompatibilityTokenCounter>,
+    /// Retained empty slot for internal compatibility; never populated
+    #[allow(dead_code)]
+    pub light_kanji: Option<CompatibilityTokenCounter>,
     /// Candidate rewriters (half-width katakana, symbol variants)
     pub rewriters: RewriterChain,
 }
 
 /// Input mode for the IME engine
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputMode {
     /// Hiragana mode (default) — romaji is converted to hiragana
-    #[default]
     Hiragana,
     /// Katakana mode — preedit displays katakana instead of hiragana
     Katakana,
@@ -152,97 +172,12 @@ pub(crate) enum InputMode {
     Alphabet,
     /// Emoji shortcode mode — entered by typing `:` from Empty state.
     /// Behaves like [`InputMode::Alphabet`] (ASCII inserted directly,
-    /// no romaji conversion) but auto-exits back to the prior mode on
-    /// commit/cancel (see [`ModeState`]) so the next word lands in kana
-    /// mode without the user having to toggle anything. The `EmojiRewriter`
-    /// picks up the `:`-prefixed input from the candidate-build pipeline
-    /// and surfaces emoji candidates as the user types.
+    /// no romaji conversion) but auto-exits back to [`InputMode::Hiragana`]
+    /// on commit/cancel so the next word lands in kana mode without the
+    /// user having to toggle anything. The `EmojiRewriter` picks up the
+    /// `:`-prefixed input from the candidate-build pipeline and surfaces
+    /// emoji candidates as the user types.
     Emoji,
-}
-
-/// Input-mode state: the current [`InputMode`] plus the mode to come back
-/// to when a *temporary* mode ends.
-///
-/// [`InputMode::Emoji`] (entered by typing `:`) and [`InputMode::Alphabet`]
-/// (entered via Shift+letter) are temporary, per-composition modes: commit,
-/// cancel, and backspace-to-empty exit them and put the user back in the
-/// kana mode they came from (e.g. a Katakana-mode user lands back in
-/// Katakana) instead of dropping them in Hiragana every time.
-///
-/// Modeled after mozc's `Composer` (`src/composer/composer.cc`), which
-/// pairs `input_mode_` with a non-optional `comeback_input_mode_`.
-/// `comeback` always holds the last *non-temporary* mode and equals
-/// `current` whenever the current mode itself is not temporary, so exiting
-/// is an unconditional `current = comeback` with no fallback case. Because
-/// `comeback` can never be a temporary mode, even the degenerate hop from
-/// one temporary mode into another (Shift+letter while composing an emoji
-/// query moves Emoji → Alphabet) still exits to the user's real kana mode.
-///
-/// The fields are private so every transition goes through the methods
-/// below, which maintain that invariant by construction.
-#[derive(Debug, Default)]
-pub(crate) struct ModeState {
-    /// Current input mode.
-    current: InputMode,
-    /// The last non-temporary mode; what [`ModeState::exit_temporary`]
-    /// restores. Equal to `current` whenever `current` is not temporary
-    /// (mozc's `comeback_input_mode_` invariant).
-    comeback: InputMode,
-}
-
-impl ModeState {
-    /// Whether `mode` is a temporary, per-composition mode.
-    fn is_temporary(mode: InputMode) -> bool {
-        matches!(mode, InputMode::Emoji | InputMode::Alphabet)
-    }
-
-    /// The current input mode.
-    pub(crate) fn current(&self) -> InputMode {
-        self.current
-    }
-
-    /// Switch directly to `mode` (the mode-toggle key → Hiragana, Ctrl+K →
-    /// Katakana). The user explicitly picked a mode, so it also becomes the
-    /// comeback target (mozc's `SetInputMode`).
-    pub(crate) fn set(&mut self, mode: InputMode) {
-        debug_assert!(
-            !Self::is_temporary(mode),
-            "temporary mode {mode:?} must be entered via enter_temporary"
-        );
-        self.current = mode;
-        self.comeback = mode;
-    }
-
-    /// Enter a *temporary* mode (Emoji or Alphabet), remembering the
-    /// current mode for [`ModeState::exit_temporary`] (mozc's
-    /// `SetTemporaryInputMode`). Hopping from one temporary mode into
-    /// another keeps the original comeback target, so re-entry can't
-    /// clobber the saved mode.
-    pub(crate) fn enter_temporary(&mut self, mode: InputMode) {
-        debug_assert!(
-            Self::is_temporary(mode),
-            "enter_temporary called with non-temporary mode {mode:?}"
-        );
-        if !Self::is_temporary(self.current) {
-            self.comeback = self.current;
-        }
-        self.current = mode;
-    }
-
-    /// End any temporary mode: come back to the last non-temporary mode.
-    /// No-op when the current mode is not temporary (`comeback` equals
-    /// `current` then), so it's safe to call unconditionally from the
-    /// commit/cancel/erase-to-empty exit sites.
-    ///
-    /// This is what makes Shift-triggered alphabet input *temporary*: once
-    /// the word is committed (or abandoned), the next word returns to kana
-    /// without an explicit toggle key — the behavior US-layout users expect,
-    /// since they have no JIS かな key to switch back with (issue #37).
-    /// Likewise an emoji session is bound to the typed `:` and is over once
-    /// the query is committed, cancelled, or erased.
-    pub(crate) fn exit_temporary(&mut self) {
-        self.current = self.comeback;
-    }
 }
 
 /// One internal chunk of the composing buffer (at most
@@ -260,11 +195,20 @@ impl ModeState {
 /// here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::core) struct ComposingChunk {
+    /// Character offset of this chunk in the handler-produced reading plan.
+    pub position: usize,
     /// Hiragana reading for this chunk (≤ N chars).
     pub reading: String,
     /// Model conversion of `reading` — this chunk's slice of the live preedit.
     /// Falls back to `reading` when the model yields nothing.
     pub converted: String,
+    /// Whether `converted` is an accepted result for this exact chunk.
+    ///
+    /// This is deliberately independent from `converted == reading`: a model
+    /// may validly return the raw reading, and an unchanged cached chunk must
+    /// not be reconverted merely because its output happens to equal its
+    /// input.
+    pub fresh: bool,
 }
 
 /// Live conversion state: enabled flag and current converted text
@@ -321,4 +265,6 @@ pub(in crate::core) struct ConversionMetrics {
     /// Adaptive flag: set when the main model exceeded max_latency_ms
     /// Reset when a new word begins (Empty state)
     pub adaptive_use_light_model: bool,
+    /// Token count proposed by the worker for the last matching snapshot.
+    pub token_count: Option<usize>,
 }

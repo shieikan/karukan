@@ -197,9 +197,7 @@ fn test_current_chunk_index_with_variable_length_chunks() {
 
 #[test]
 fn test_backspace_clears_chunks_until_next_live_refresh() {
-    // Backspace is a destructive correction gesture: keep the preedit in raw
-    // reading form and drop cached conversions so stale live text cannot be
-    // reused while the user is figuring out what remains.
+    // Destructive correction stays raw until the next ordinary input refresh.
     let mut engine = make_chunk_engine(2);
     type_aiue(&mut engine); // ["あい", "うえ"]
     assert_eq!(engine.chunks.len(), 2);
@@ -262,13 +260,10 @@ fn type_aiueoka(engine: &mut InputMethodEngine) {
 
 #[test]
 fn test_delete_from_front_clears_chunks_until_next_live_refresh() {
-    // Deleting from the front should not keep an unchanged suffix conversion
-    // on screen; the user needs to see the raw remaining reading.
+    // Correction mode must not leave a stale converted suffix on screen.
     let mut engine = make_chunk_engine(2);
     type_aiue(&mut engine); // "あいうえ" → ["あい", "うえ"]
     assert_eq!(engine.chunks.len(), 2);
-    engine.chunks[1].converted = "SENTINEL".to_string();
-
     // Delete the first chunk's two chars ("あい") from the front.
     engine.process_key(&press_key(Keysym::HOME));
     engine.process_key(&press_key(Keysym::DELETE));
@@ -281,14 +276,10 @@ fn test_delete_from_front_clears_chunks_until_next_live_refresh() {
 
 #[test]
 fn test_middle_delete_clears_chunks_until_next_live_refresh() {
-    // Deleting inside the middle of a composition should not keep neighboring
-    // cached conversions visible; raw reading is the legible correction mode.
+    // Correction mode shows the full remaining reading without stale chunks.
     let mut engine = make_chunk_engine(2);
     type_aiueoka(&mut engine); // "あいうえおか" → ["あい", "うえ", "おか"]
     assert_eq!(engine.chunks.len(), 3);
-    engine.chunks[0].converted = "S0".to_string();
-    engine.chunks[2].converted = "S2".to_string();
-
     // Cursor after う (pos 3), backspace deletes う — inside the middle chunk.
     engine.process_key(&press_key(Keysym::HOME));
     engine.process_key(&press_key(Keysym::RIGHT));
@@ -347,4 +338,29 @@ fn test_append_reuses_leading_chunks() {
     assert_eq!(readings, vec!["あい", "うえ", "お"]);
     // The leading chunk was reused, not reconverted.
     assert_eq!(engine.chunks[0].converted, "KEEP0");
+}
+
+#[test]
+fn test_append_after_fresh_raw_result_leading_chunk_is_not_reconverted() {
+    let mut engine = make_chunk_engine(1);
+    engine.input_buf.insert("あ");
+    engine.chunked_auto_suggest();
+    assert_eq!(engine.chunks[0].reading, "あ");
+
+    // A model may validly return the raw reading. Mark that accepted result
+    // fresh explicitly; equality with `reading` is not a dirty signal.
+    engine.chunks[0].fresh = true;
+    engine.input_buf.insert("い");
+    engine.chunked_auto_suggest();
+
+    let requests = engine.chunk_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.reading.as_str())
+            .collect::<Vec<_>>(),
+        vec!["あ", "い"]
+    );
+    assert!(!requests[0].should_convert);
+    assert!(requests[1].should_convert);
 }

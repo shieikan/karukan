@@ -1,7 +1,5 @@
 //! Conversion strategy determination and adaptive model selection
 
-use tracing::debug;
-
 use crate::config::settings::StrategyMode;
 
 use super::*;
@@ -78,67 +76,6 @@ fn determine_adaptive_strategy(
         } else {
             // Long input: proactively use light model
             ConversionStrategy::LightModelOnly
-        }
-    }
-}
-
-impl InputMethodEngine {
-    /// Determine the conversion strategy based on input token counts, adaptive latency
-    /// flag, and configuration.
-    ///
-    /// Counts tokens using the main model's tokenizer and delegates to
-    /// `determine_conversion_strategy` for the actual decision logic.
-    pub(super) fn determine_strategy(
-        &self,
-        reading: &str,
-        num_candidates: usize,
-    ) -> ConversionStrategy {
-        let has_light_model = self.converters.light_kanji.is_some();
-        let katakana = karukan_engine::hiragana_to_katakana(reading);
-
-        // Count tokens using main model's tokenizer
-        let Some(converter) = &self.converters.kanji else {
-            return ConversionStrategy::MainModelOnly;
-        };
-
-        let reading_tokens = match converter.count_input_tokens(&katakana) {
-            Ok(n) => n,
-            Err(e) => {
-                debug!(
-                    "Failed to count reading tokens: {}, fallback to MainModelOnly",
-                    e
-                );
-                return ConversionStrategy::MainModelOnly;
-            }
-        };
-
-        determine_conversion_strategy(
-            reading_tokens,
-            num_candidates,
-            has_light_model,
-            self.metrics.adaptive_use_light_model,
-            &self.config,
-        )
-    }
-
-    /// Update the adaptive model switching flag based on the strategy used and
-    /// measured latency. Only updates when the main model was involved.
-    pub(super) fn update_adaptive_model_flag(&mut self, strategy: &ConversionStrategy) {
-        // Only Adaptive mode uses the adaptive flag
-        if self.config.strategy != StrategyMode::Adaptive {
-            return;
-        }
-        if self.config.max_latency_ms == 0 || self.converters.light_kanji.is_none() {
-            return;
-        }
-        match strategy {
-            ConversionStrategy::MainModelOnly | ConversionStrategy::ParallelBeam { .. } => {
-                self.metrics.adaptive_use_light_model =
-                    self.metrics.conversion_ms > self.config.max_latency_ms;
-            }
-            ConversionStrategy::LightModelOnly | ConversionStrategy::MainModelBeam { .. } => {
-                // Don't update — light model latency doesn't reflect main model speed
-            }
         }
     }
 }

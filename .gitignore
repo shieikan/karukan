@@ -38,7 +38,6 @@ data/
 # Tracked data: symbol descriptions / variants for the rewriter
 !karukan-engine/data/
 *.json
-!renovate.json
 *.cache
 
 .fake

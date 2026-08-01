@@ -9,7 +9,9 @@
 //! Each variant carries a description tagged with mozc's width markers
 //! (`[半]` / `[全]`) plus 大文字/小文字, e.g. `ＡＢＣ` → `[全]英大文字`.
 
-use super::{RewriteOutput, Rewriter, to_fullwidth, to_halfwidth};
+use crate::kana::{ascii_to_fullwidth_char, fullwidth_to_ascii_char};
+
+use super::{RewriteOutput, Rewriter};
 
 /// Rewriter that produces width/case variants for alphabetic input.
 pub struct AlphabetRewriter;
@@ -38,14 +40,14 @@ enum Case {
 
 /// Build one variant + its mozc-style description.
 fn build_variant(original: &str, width: Width, case: Case) -> (String, &'static str) {
-    let half = to_halfwidth(original);
+    let half: String = original.chars().map(fullwidth_to_ascii_char).collect();
     let cased = match case {
         Case::Lower => half.to_ascii_lowercase(),
         Case::Upper => half.to_ascii_uppercase(),
     };
     let text = match width {
         Width::Half => cased,
-        Width::Full => to_fullwidth(&cased),
+        Width::Full => cased.chars().map(ascii_to_fullwidth_char).collect(),
     };
     let desc = match (width, case) {
         (Width::Half, Case::Lower) => "[半]英小文字",

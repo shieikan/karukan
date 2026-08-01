@@ -2,11 +2,6 @@
 
 use super::*;
 
-/// Deletion hint appended to the conversion aux text while a learning-cache
-/// candidate is selected. Names Backspace rather than Delete because the Mac
-/// "delete" key is Backspace — one wording everywhere.
-pub(super) const LEARNING_DELETE_HINT: &str = "Ctrl+Backspaceで履歴から削除";
-
 impl InputMethodEngine {
     /// Build display text from the input buffer and romaji buffer
     /// Format: composed[:cursor] + romaji_buffer + composed[cursor:]
@@ -26,7 +21,7 @@ impl InputMethodEngine {
             .collect();
         let buffer = self.converters.romaji.buffer();
 
-        let katakana = self.mode.current() == InputMode::Katakana;
+        let katakana = self.input_mode == InputMode::Katakana;
         let display_before = if katakana {
             karukan_engine::hiragana_to_katakana(&before)
         } else {
@@ -58,8 +53,10 @@ impl InputMethodEngine {
         } else {
             (self.build_input_display(), self.display_caret_position())
         };
-        let mut preedit = Preedit::with_text_underlined(&display);
+        let len = display.chars().count();
+        let mut preedit = Preedit::with_text(&display);
         preedit.set_caret(caret);
+        preedit.set_attributes(vec![PreeditAttribute::underline(0, len)]);
         preedit
     }
 
@@ -72,16 +69,19 @@ impl InputMethodEngine {
             return String::new();
         }
         let lctx = left.filter(|s| !s.is_empty()).map(|left| {
-            if left.chars().count() > max_len {
-                format!("...{}", keep_last_chars(left, max_len))
+            let char_count = left.chars().count();
+            if char_count > max_len {
+                let start = char_count - max_len;
+                format!("...{}", left.chars().skip(start).collect::<String>())
             } else {
                 left.to_string()
             }
         });
 
         let rctx = right.filter(|s| !s.is_empty()).map(|right| {
-            if right.chars().count() > max_len {
-                format!("{}...", keep_first_chars(right, max_len))
+            let char_count = right.chars().count();
+            if char_count > max_len {
+                format!("{}...", right.chars().take(max_len).collect::<String>())
             } else {
                 right.to_string()
             }
@@ -124,7 +124,7 @@ impl InputMethodEngine {
 
     /// Get the current mode indicator string
     pub(super) fn mode_indicator(&self) -> String {
-        let base = match self.mode.current() {
+        let base = match self.input_mode {
             InputMode::Alphabet => "[A]",
             InputMode::Katakana => "[カ]",
             InputMode::Hiragana => "[あ]",
@@ -185,11 +185,6 @@ impl InputMethodEngine {
         candidates: Option<&CandidateList>,
     ) -> String {
         let ctx = self.display_context();
-        let ctx = if ctx.is_empty() {
-            String::new()
-        } else {
-            format!(" | {}", ctx)
-        };
         let timing = format!(
             "{}ms/{}ms",
             self.metrics.conversion_ms, self.metrics.process_key_ms
@@ -203,21 +198,23 @@ impl InputMethodEngine {
             .filter(|c| c.total_pages() > 1)
             .map(|c| format!(" ({}/{})", c.current_page() + 1, c.total_pages()))
             .unwrap_or_default();
-        let selected = candidates.and_then(|c| c.selected());
-        let source_label = selected
-            .and_then(Candidate::source_label)
+        let source_label = candidates
+            .and_then(|c| c.selected())
+            .and_then(|c| c.source_label.as_deref())
+            .filter(|a| !a.is_empty())
             .map(|a| format!(" | {}", a))
             .unwrap_or_default();
-        // Footer hint, shown only while the selected candidate is a
-        // deletable user-history entry.
-        let delete_hint = selected
-            .filter(|c| c.is_deletable())
-            .map(|_| format!(" ({})", LEARNING_DELETE_HINT))
-            .unwrap_or_default();
-        format!(
-            "[変換]{} {}{} | {} {} | {}{}{}",
-            page_info, reading, ctx, timing, tokens, model, source_label, delete_hint
-        )
+        if ctx.is_empty() {
+            format!(
+                "[変換]{} {} | {} {} | {}{}",
+                page_info, reading, timing, tokens, model, source_label
+            )
+        } else {
+            format!(
+                "[変換]{} {} | {} | {} {} | {}{}",
+                page_info, reading, ctx, timing, tokens, model, source_label
+            )
+        }
     }
 
     /// Format aux text for auto-suggest mode
@@ -265,6 +262,12 @@ impl InputMethodEngine {
 
     /// Truncate a context string to safe size for API calls
     pub(super) fn truncate_context(&self, context: &str) -> String {
-        keep_last_chars(context, self.config.max_api_context_len)
+        let char_count = context.chars().count();
+        if char_count > self.config.max_api_context_len {
+            let start = char_count - self.config.max_api_context_len;
+            context.chars().skip(start).collect()
+        } else {
+            context.to_string()
+        }
     }
 }

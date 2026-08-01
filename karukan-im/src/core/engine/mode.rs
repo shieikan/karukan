@@ -6,17 +6,15 @@ use super::*;
 
 impl InputMethodEngine {
     /// Enter katakana mode (Ctrl+k)
-    /// One-way switch to Katakana; a mode toggle key (Right Super, JIS 変換,
-    /// macOS かな/right-⌘ tap) returns to Hiragana.
+    /// One-way switch to Katakana; use Right Super to return to Hiragana.
     pub(super) fn enter_katakana_mode(&mut self) -> EngineResult {
         // Already in katakana mode: nothing to do
-        if self.mode.current() == InputMode::Katakana {
+        if self.input_mode == InputMode::Katakana {
             return EngineResult::consumed();
         }
 
-        self.mode.set(InputMode::Katakana);
-        // Clear live conversion text so katakana mode takes priority on commit
-        self.live.text.clear();
+        self.invalidate_async_conversion(true);
+        self.input_mode = InputMode::Katakana;
 
         let romaji_buffer = self.converters.romaji.buffer().to_string();
 
@@ -41,21 +39,22 @@ impl InputMethodEngine {
     /// live result. When toggled OFF, drop any stale converted text so the
     /// preedit reverts to hiragana right away.
     pub(super) fn toggle_live_conversion(&mut self) -> EngineResult {
+        let had_live_conversion = !self.live.text.is_empty();
+        self.invalidate_async_conversion(false);
         self.live.enabled = !self.live.enabled;
         let mode = if self.live.enabled { "ON" } else { "OFF" };
         debug!("Live conversion toggled: {}", mode);
         let aux = EngineAction::UpdateAuxText(format!("ライブ変換: {}", mode));
 
         if matches!(self.state, InputState::Composing { .. })
-            && self.mode.current() != InputMode::Katakana
+            && self.input_mode != InputMode::Katakana
         {
             if self.live.enabled {
                 let mut result = self.refresh_input_state();
                 result.actions.push(aux);
                 return result;
             }
-            if !self.live.text.is_empty() {
-                self.live.text.clear();
+            if had_live_conversion {
                 let preedit = self.set_composing_state();
                 return EngineResult::consumed()
                     .with_action(EngineAction::UpdatePreedit(preedit))

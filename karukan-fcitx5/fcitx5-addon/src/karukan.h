@@ -8,6 +8,7 @@
 #include <fcitx/addonfactory.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/candidatelist.h>
+#include <fcitx-utils/event.h>
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputmethodengine.h>
 #include <fcitx/instance.h>
@@ -35,11 +36,12 @@ private:
 // Candidate list class
 class KarukanCandidateList : public CommonCandidateList {
 public:
-    KarukanCandidateList(KarukanEngine* engine);
+    KarukanCandidateList(KarukanEngine* engine, InputContext* ic);
     void updateCandidates(::KarukanEngine* rustEngine);
 
 private:
     KarukanEngine* engine_;
+    InputContext* ic_;
 };
 
 // Per-input-context state
@@ -51,16 +53,19 @@ public:
     void keyEvent(KeyEvent& keyEvent);
     void reset();
     void updateUI();
-    void captureSurroundingText();
-    void emitPendingCommit();
 
     ::KarukanEngine* rustEngine() { return rustEngine_; }
 
 private:
+    friend class KarukanEngine;
+
+    void scheduleCompletionPoll();
+    void cancelCompletionPoll();
+
     KarukanEngine* engine_;
     InputContext* ic_;
     ::KarukanEngine* rustEngine_{nullptr};
-    bool engineInitialized_{false};
+    std::unique_ptr<EventSourceTime> completionPollEvent_;
 };
 
 // Main engine class
@@ -74,7 +79,11 @@ public:
     void activate(const InputMethodEntry& entry, InputContextEvent& event) override;
     void deactivate(const InputMethodEntry& entry, InputContextEvent& event) override;
 
+    Instance* instance() { return instance_; }
+
     void selectCandidate(InputContext* ic, int index);
+
+    auto& factory() { return factory_; }
 
 private:
     Instance* instance_;

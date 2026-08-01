@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A single learned conversion entry.
@@ -20,38 +20,6 @@ pub struct LearningEntry {
     pub last_access: u64,
 }
 
-/// Size limits for a [`LearningCache`].
-///
-/// Passed whole at construction ([`LearningCache::new`] /
-/// [`LearningCache::load`]) so a caller can't apply one limit and forget the
-/// other — there is no post-construction setter to miss.
-#[derive(Debug, Clone, Copy)]
-pub struct LearningConfig {
-    /// Maximum number of total entries across all readings; lowest-score
-    /// entries are evicted on save when over this limit.
-    pub max_entries: usize,
-    /// Maximum surface length (Unicode chars) that [`LearningCache::record`]
-    /// accepts. Keeps whole-sentence live-conversion commits — one-off text
-    /// that never matches again — out of the cache.
-    pub max_surface_chars: usize,
-}
-
-impl LearningConfig {
-    /// Default for [`max_entries`](Self::max_entries).
-    pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
-    /// Default for [`max_surface_chars`](Self::max_surface_chars).
-    pub const DEFAULT_MAX_SURFACE_CHARS: usize = 50;
-}
-
-impl Default for LearningConfig {
-    fn default() -> Self {
-        Self {
-            max_entries: Self::DEFAULT_MAX_ENTRIES,
-            max_surface_chars: Self::DEFAULT_MAX_SURFACE_CHARS,
-        }
-    }
-}
-
 /// In-memory cache of user learning data.
 ///
 /// Keyed by reading (hiragana). Each reading maps to a list of surface
@@ -60,29 +28,24 @@ impl Default for LearningConfig {
 pub struct LearningCache {
     entries: HashMap<String, Vec<LearningEntry>>,
     max_entries: usize,
-    max_surface_chars: usize,
     dirty: bool,
 }
 
 impl LearningCache {
-    /// Create an empty cache with the given limits.
-    pub fn new(config: LearningConfig) -> Self {
+    /// Default maximum number of total entries across all readings.
+    pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
+
+    /// Create an empty cache with the given entry limit.
+    pub fn new(max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            max_entries: config.max_entries,
-            max_surface_chars: config.max_surface_chars,
+            max_entries,
             dirty: false,
         }
     }
 
     /// Record a user selection. Increments frequency and updates last_access.
-    ///
-    /// Surfaces longer than `max_surface_chars` are skipped; see
-    /// [`LearningConfig::max_surface_chars`] for why.
     pub fn record(&mut self, reading: &str, surface: &str) {
-        if surface.chars().count() > self.max_surface_chars {
-            return;
-        }
         let now = now_unix();
         let entries = self.entries.entry(reading.to_string()).or_default();
 
@@ -97,29 +60,6 @@ impl LearningCache {
             });
         }
         self.dirty = true;
-    }
-
-    /// Remove every learned entry that would resurface `surface` for input
-    /// `reading`: the exact-reading entry plus every longer reading with
-    /// `reading` as a prefix (the [`prefix_lookup`](Self::prefix_lookup)
-    /// fan-out) — an exact-only delete would leave a twin that pops back on
-    /// the next conversion. Returns whether anything was removed; persisted
-    /// at the next `save`.
-    pub fn remove_suggestion(&mut self, reading: &str, surface: &str) -> bool {
-        let mut removed = false;
-        self.entries.retain(|r, entries| {
-            if !r.starts_with(reading) {
-                return true;
-            }
-            let before = entries.len();
-            entries.retain(|e| e.surface != surface);
-            removed |= entries.len() != before;
-            !entries.is_empty()
-        });
-        if removed {
-            self.dirty = true;
-        }
-        removed
     }
 
     /// Exact-match lookup: returns `(surface, score)` pairs sorted by score descending.
@@ -156,10 +96,10 @@ impl LearningCache {
     ///
     /// Format: `reading\tsurface\tfrequency\tlast_access`
     /// Lines starting with `#` are comments.
-    pub fn load(path: &Path, config: LearningConfig) -> anyhow::Result<Self> {
+    pub fn load(path: &Path, max_entries: usize) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
-        let mut cache = Self::new(config);
+        let mut cache = Self::new(max_entries);
 
         for line in reader.lines() {
             let line = line?;
@@ -200,33 +140,68 @@ impl LearningCache {
 
     /// Save the cache to a TSV file, evicting low-score entries if over capacity.
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
-        self.evict();
+        self.save_with_rename(path, |temporary, destination| {
+            std::fs::rename(temporary, destination)
+        })
+    }
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    /// Save through a same-directory temporary file and atomically rename it.
+    ///
+    /// The rename operation is injected so tests can deterministically prove
+    /// that a failed replacement leaves both destination bytes and live cache
+    /// state untouched.
+    fn save_with_rename<R>(&mut self, path: &Path, rename: R) -> anyhow::Result<()>
+    where
+        R: Fn(&Path, &Path) -> std::io::Result<()>,
+    {
+        let parent = normalized_parent_dir(path);
+        std::fs::create_dir_all(parent)?;
 
-        let file = std::fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
-        writeln!(writer, "# karukan learning cache v1")?;
+        let mut persisted = Self {
+            entries: self.entries.clone(),
+            max_entries: self.max_entries,
+            dirty: self.dirty,
+        };
+        persisted.evict();
 
-        // Sort readings for deterministic output
-        let mut readings: Vec<&String> = self.entries.keys().collect();
-        readings.sort();
+        let (file, temporary_path) = create_temporary_file(path)?;
+        let write_result = (|| -> anyhow::Result<()> {
+            let mut writer = std::io::BufWriter::new(file);
+            writeln!(writer, "# karukan learning cache v1")?;
 
-        for reading in readings {
-            if let Some(entries) = self.entries.get(reading) {
-                for entry in entries {
-                    writeln!(
-                        writer,
-                        "{}\t{}\t{}\t{}",
-                        reading, entry.surface, entry.frequency, entry.last_access
-                    )?;
+            // Sort readings for deterministic output
+            let mut readings: Vec<&String> = persisted.entries.keys().collect();
+            readings.sort();
+
+            for reading in readings {
+                if let Some(entries) = persisted.entries.get(reading) {
+                    for entry in entries {
+                        writeln!(
+                            writer,
+                            "{}\t{}\t{}\t{}",
+                            reading, entry.surface, entry.frequency, entry.last_access
+                        )?;
+                    }
                 }
             }
+
+            writer.flush()?;
+            let file = writer.into_inner().map_err(|error| error.into_error())?;
+            file.sync_all()?;
+            drop(file);
+            rename(&temporary_path, path)?;
+            // Best-effort directory barrier after the atomic replacement. Some
+            // platforms/filesystems do not support syncing directory handles.
+            let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temporary_path);
+            return write_result;
         }
 
-        writer.flush()?;
+        self.entries = persisted.entries;
         self.dirty = false;
         Ok(())
     }
@@ -284,6 +259,44 @@ impl LearningCache {
     }
 }
 
+const MAX_TEMPORARY_FILE_ATTEMPTS: usize = 16;
+
+fn normalized_parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn temporary_path(path: &Path, attempt: usize) -> PathBuf {
+    let parent = normalized_parent_dir(path);
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "learning-cache".into());
+    file_name.push(format!(".tmp-{}-{attempt}", std::process::id()));
+    parent.join(file_name)
+}
+
+fn create_temporary_file(path: &Path) -> anyhow::Result<(std::fs::File, PathBuf)> {
+    for attempt in 0..MAX_TEMPORARY_FILE_ATTEMPTS {
+        let temporary_path = temporary_path(path, attempt);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((file, temporary_path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "could not create a unique temporary learning cache file after {MAX_TEMPORARY_FILE_ATTEMPTS} attempts"
+    ))
+}
+
 /// Compute a candidate score: recency-weighted with frequency bonus.
 ///
 /// Inspired by mozc's UserHistoryPredictor: recent selections rank higher,
@@ -310,23 +323,11 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Config/cache with a custom entry limit and the default surface cap.
-    fn config_with(max_entries: usize) -> LearningConfig {
-        LearningConfig {
-            max_entries,
-            ..LearningConfig::default()
-        }
-    }
-
-    fn cache_with(max_entries: usize) -> LearningCache {
-        LearningCache::new(config_with(max_entries))
-    }
     use tempfile::NamedTempFile;
 
     #[test]
     fn test_record_and_lookup() {
-        let mut cache = cache_with(100);
+        let mut cache = LearningCache::new(100);
 
         cache.record("きょう", "今日");
         cache.record("きょう", "京");
@@ -341,14 +342,14 @@ mod tests {
 
     #[test]
     fn test_lookup_empty() {
-        let cache = cache_with(100);
+        let cache = LearningCache::new(100);
         let results = cache.lookup("きょう");
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_prefix_lookup() {
-        let mut cache = cache_with(100);
+        let mut cache = LearningCache::new(100);
         cache.record("きょう", "今日");
         cache.record("きょうと", "京都");
         cache.record("あした", "明日");
@@ -363,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_prefix_lookup_no_match() {
-        let mut cache = cache_with(100);
+        let mut cache = LearningCache::new(100);
         cache.record("きょう", "今日");
         let results = cache.prefix_lookup("あ");
         assert!(results.is_empty());
@@ -371,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load() {
-        let mut cache = cache_with(100);
+        let mut cache = LearningCache::new(100);
         cache.record("きょう", "今日");
         cache.record("きょう", "今日");
         cache.record("きょう", "京");
@@ -383,7 +384,7 @@ mod tests {
         cache.save(&path).unwrap();
         assert!(!cache.is_dirty());
 
-        let loaded = LearningCache::load(&path, config_with(100)).unwrap();
+        let loaded = LearningCache::load(&path, 100).unwrap();
         assert!(!loaded.is_dirty());
         assert_eq!(loaded.entry_count(), 3);
 
@@ -394,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_dirty_flag() {
-        let mut cache = cache_with(100);
+        let mut cache = LearningCache::new(100);
         assert!(!cache.is_dirty());
 
         cache.record("きょう", "今日");
@@ -407,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_eviction() {
-        let mut cache = cache_with(3);
+        let mut cache = LearningCache::new(3);
 
         // Add 5 entries
         cache.record("a", "A");
@@ -462,13 +463,13 @@ mod tests {
 
     #[test]
     fn test_load_nonexistent_file() {
-        let result = LearningCache::load(Path::new("/nonexistent/path"), config_with(100));
+        let result = LearningCache::load(Path::new("/nonexistent/path"), 100);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_tsv_format() {
-        let mut cache = cache_with(100);
+        let mut cache = LearningCache::new(100);
         cache.record("きょう", "今日");
 
         let file = NamedTempFile::new().unwrap();
@@ -488,105 +489,11 @@ mod tests {
         )
         .unwrap();
 
-        let cache = LearningCache::load(file.path(), config_with(100)).unwrap();
+        let cache = LearningCache::load(file.path(), 100).unwrap();
         assert_eq!(cache.entry_count(), 1);
         let results = cache.lookup("きょう");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "今日");
-    }
-
-    #[test]
-    fn test_remove_suggestion_last_surface_drops_reading() {
-        let mut cache = cache_with(100);
-        cache.record("きょう", "今日");
-
-        assert!(cache.remove_suggestion("きょう", "今日"));
-        assert_eq!(cache.entry_count(), 0);
-        assert!(cache.lookup("きょう").is_empty());
-        assert!(cache.prefix_lookup("き").is_empty());
-    }
-
-    #[test]
-    fn test_remove_suggestion_clears_exact_and_prefix_twins() {
-        let mut cache = cache_with(100);
-        cache.record("あい", "藍");
-        cache.record("あいさ", "藍"); // same surface, longer reading (a twin)
-        cache.record("あい", "愛"); // different surface under the same reading
-        cache.record("うみ", "藍"); // same surface, unrelated reading
-
-        let file = NamedTempFile::new().unwrap();
-        cache.save(file.path()).unwrap();
-        assert!(!cache.is_dirty());
-
-        assert!(cache.remove_suggestion("あい", "藍"));
-        assert!(cache.is_dirty(), "removal must mark the cache dirty");
-
-        // Both the exact entry and the prefix twin are gone...
-        assert!(cache.lookup("あい").iter().all(|(s, _)| s != "藍"));
-        assert!(cache.lookup("あいさ").is_empty());
-        // ...but a different surface under the same reading survives...
-        assert!(cache.lookup("あい").iter().any(|(s, _)| s == "愛"));
-        // ...and the same surface under an unrelated reading is untouched.
-        assert!(cache.lookup("うみ").iter().any(|(s, _)| s == "藍"));
-    }
-
-    #[test]
-    fn test_remove_suggestion_nonexistent_is_noop() {
-        let mut cache = cache_with(100);
-        cache.record("あい", "藍");
-
-        let file = NamedTempFile::new().unwrap();
-        cache.save(file.path()).unwrap();
-
-        assert!(!cache.remove_suggestion("あい", "愛"));
-        assert!(!cache.remove_suggestion("かき", "柿"));
-        assert!(!cache.is_dirty(), "no-op removal must not mark dirty");
-    }
-
-    #[test]
-    fn test_record_skips_long_surface() {
-        let mut cache = LearningCache::new(LearningConfig {
-            max_entries: 100,
-            max_surface_chars: 5,
-        });
-
-        cache.record("あ", &"漢".repeat(6));
-        assert_eq!(cache.entry_count(), 0);
-        assert!(!cache.is_dirty());
-
-        // Boundary: exactly max_surface_chars is accepted.
-        cache.record("あ", &"漢".repeat(5));
-        assert_eq!(cache.entry_count(), 1);
-    }
-
-    #[test]
-    fn test_record_ignores_reading_length() {
-        let mut cache = LearningCache::new(LearningConfig {
-            max_entries: 100,
-            max_surface_chars: 5,
-        });
-
-        // Only the surface is capped; a long reading with a short surface
-        // is fine (e.g. a long kana reading converting to a short word).
-        cache.record(&"あ".repeat(30), "短い");
-        assert_eq!(cache.entry_count(), 1);
-    }
-
-    #[test]
-    fn test_default_max_surface_chars() {
-        let mut cache = cache_with(100);
-
-        cache.record(
-            "よみ",
-            &"あ".repeat(LearningConfig::DEFAULT_MAX_SURFACE_CHARS + 1),
-        );
-        assert_eq!(cache.entry_count(), 0);
-
-        cache.record(
-            "よみ",
-            &"あ".repeat(LearningConfig::DEFAULT_MAX_SURFACE_CHARS),
-        );
-        assert_eq!(cache.entry_count(), 1);
     }
 
     #[test]
@@ -598,8 +505,110 @@ mod tests {
         )
         .unwrap();
 
-        let cache = LearningCache::load(file.path(), config_with(100)).unwrap();
+        let cache = LearningCache::load(file.path(), 100).unwrap();
         // Only the first valid line should be loaded
         assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn failed_atomic_rename_preserves_file_entries_and_dirty_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("learning.tsv");
+        let original = b"# prior destination\nprior\tbytes\t1\t2\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut cache = LearningCache::new(1);
+        cache.record("あい", "藍");
+        cache.record("うえ", "上");
+        assert!(cache.is_dirty());
+
+        let result = cache.save_with_rename(&path, |_temporary, _destination| {
+            Err(std::io::Error::other("deterministic rename failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.lookup("あい")[0].0, "藍");
+        assert_eq!(cache.lookup("うえ")[0].0, "上");
+        assert!(cache.is_dirty());
+
+        let temporary_files: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "learning.tsv")
+            .collect();
+        assert!(
+            temporary_files.is_empty(),
+            "temporary files left behind: {temporary_files:?}"
+        );
+    }
+
+    #[test]
+    fn relative_destination_normalizes_empty_parent_to_current_directory() {
+        assert_eq!(
+            normalized_parent_dir(Path::new("learning.tsv")),
+            Path::new(".")
+        );
+        assert_eq!(
+            normalized_parent_dir(Path::new("cache/learning.tsv")),
+            Path::new("cache")
+        );
+    }
+
+    #[test]
+    fn save_advances_when_first_temporary_path_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("learning.tsv");
+        let occupied_path = temporary_path(&path, 0);
+        let marker = b"must not be overwritten";
+        std::fs::write(&occupied_path, marker).unwrap();
+
+        let mut cache = LearningCache::new(100);
+        cache.record("あい", "藍");
+        cache.save(&path).unwrap();
+
+        assert_eq!(std::fs::read(&occupied_path).unwrap(), marker);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("あい\t藍\t1\t")
+        );
+    }
+
+    #[test]
+    fn all_temporary_path_collisions_preserve_destination_and_live_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("learning.tsv");
+        let original = b"# prior destination\nprior\tbytes\t1\t2\n";
+        std::fs::write(&path, original).unwrap();
+
+        let markers: Vec<Vec<u8>> = (0..MAX_TEMPORARY_FILE_ATTEMPTS)
+            .map(|attempt| {
+                let marker = format!("occupied temporary path {attempt}").into_bytes();
+                std::fs::write(temporary_path(&path, attempt), &marker).unwrap();
+                marker
+            })
+            .collect();
+
+        let mut cache = LearningCache::new(1);
+        cache.record("あい", "藍");
+        cache.record("うえ", "上");
+        assert!(cache.is_dirty());
+
+        let result = cache.save(&path);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.lookup("あい")[0].0, "藍");
+        assert_eq!(cache.lookup("うえ")[0].0, "上");
+        assert!(cache.is_dirty());
+        for (attempt, marker) in markers.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(temporary_path(&path, attempt)).unwrap(),
+                *marker
+            );
+        }
     }
 }

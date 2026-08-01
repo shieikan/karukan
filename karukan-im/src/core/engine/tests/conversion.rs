@@ -50,7 +50,7 @@ fn test_alphabet_mode_space_inserts_literal_space() {
 
     // Enter alphabet mode via Shift+N
     engine.process_key(&press_shift('N'));
-    assert!(engine.mode.current() == InputMode::Alphabet);
+    assert!(engine.input_mode == InputMode::Alphabet);
 
     // Type "ew"
     engine.process_key(&press('e'));

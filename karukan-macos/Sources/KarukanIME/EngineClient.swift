@@ -13,13 +13,22 @@ class EngineClient {
     private let requestQueue = DispatchQueue(label: "dev.togatoga.karukan.jsonrpc.request")
 
     private let lock = NSLock()
-    private var pendingRequests: [Int: (Data?) -> Void] = [:]
+    private struct PendingRequest {
+        let sessionEpoch: UInt64
+        let connectionEpoch: UInt64
+        let completion: (Data?) -> Void
+    }
+
+    private var pendingRequests: [Int: PendingRequest] = [:]
+    private var sessionEpoch: UInt64 = 0
+    private var connectionEpoch: UInt64 = 0
 
     /// `autoInit` re-sends `init` whenever the server (re)starts. Tests
     /// disable it to avoid loading models.
     init(serverProcess: EngineProcess, autoInit: Bool = true) {
         self.serverProcess = serverProcess
         self.serverProcess.onRestart = { [weak self] in
+            self?.beginNewSession()
             self?.startReaderLoop()
             if autoInit {
                 self?.initAsync()
@@ -45,13 +54,25 @@ class EngineClient {
         }
     }
 
-    func processKeySync(_ key: EngineKeyEvent) -> KeyResult? {
+    func processKeySync(_ key: EngineKeyEvent, isRelease: Bool = false) -> KeyResult? {
         let params: [String: Any] = [
             "keysym": key.keysym,
             "modifiers": key.modifiers.jsonObject,
-            "is_release": false,
+            "is_release": isRelease,
         ]
         return keyResultSync(method: "process_key", params: params, timeout: 3.0)
+    }
+
+    func pollAsyncConversion(completion: @escaping (KeyResult?) -> Void) {
+        sendRequest(method: "poll_async_conversion", params: [:]) { data in
+            guard let data,
+                let result = try? makeProtocolDecoder().decode(KeyResult.self, from: data)
+            else {
+                completion(nil)
+                return
+            }
+            completion(result)
+        }
     }
 
     func commitSync() -> KeyResult? {
@@ -67,6 +88,18 @@ class EngineClient {
             method: "set_surrounding_text",
             params: ["text": text, "cursor_pos": cursorPos]
         ) { _ in }
+    }
+
+    /// Reset the server state behind a monotonically increasing session epoch.
+    /// The reset request is queued after the epoch barrier, so requests queued
+    /// by the previous session cannot write into the new session. Callers can
+    /// enqueue new context/key requests from the reset completion and retain
+    /// FIFO ordering on the same request queue.
+    func resetSessionAsync(completion: (() -> Void)? = nil) {
+        advanceSessionEpoch()
+        sendRequest(method: "reset", params: [:]) { _ in
+            completion?()
+        }
     }
 
     private func keyResultSync(method: String, params: [String: Any], timeout: TimeInterval)
@@ -89,6 +122,7 @@ class EngineClient {
         guard let stdout = serverProcess.stdoutPipe else { return }
 
         let queue = DispatchQueue(label: "dev.togatoga.karukan.jsonrpc.reader")
+        let readerEpoch = currentConnectionEpoch()
         queue.async { [weak self] in
             let handle = stdout.fileHandleForReading
             var buffer = Data()
@@ -97,7 +131,7 @@ class EngineClient {
                 let chunk = handle.availableData
                 if chunk.isEmpty {
                     // EOF: server terminated
-                    self?.failAllPending()
+                    self?.failAllPending(connectionEpoch: readerEpoch)
                     break
                 }
                 buffer.append(chunk)
@@ -106,7 +140,7 @@ class EngineClient {
                     let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
                     buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
                     guard !lineData.isEmpty else { continue }
-                    self?.handleResponse(lineData)
+                    self?.handleResponse(lineData, connectionEpoch: readerEpoch)
                 }
             }
         }
@@ -119,7 +153,13 @@ class EngineClient {
         lock.lock()
         let id = nextID
         nextID += 1
-        pendingRequests[id] = completion
+        let requestEpoch = sessionEpoch
+        let requestConnectionEpoch = connectionEpoch
+        pendingRequests[id] = PendingRequest(
+            sessionEpoch: requestEpoch,
+            connectionEpoch: requestConnectionEpoch,
+            completion: completion
+        )
         lock.unlock()
 
         let request: [String: Any] = [
@@ -131,10 +171,15 @@ class EngineClient {
 
         requestQueue.async { [weak self] in
             guard let self,
+                self.isCurrentConnection(requestConnectionEpoch),
                 let stdin = self.serverProcess.stdinPipe,
                 var data = try? JSONSerialization.data(withJSONObject: request)
             else {
-                self?.takePending(id: id)?(nil)
+                self?.takePending(
+                    id: id,
+                    sessionEpoch: requestEpoch,
+                    connectionEpoch: requestConnectionEpoch
+                )?.completion(nil)
                 return
             }
             data.append(0x0A)
@@ -142,7 +187,11 @@ class EngineClient {
                 try stdin.fileHandleForWriting.write(contentsOf: data)
             } catch {
                 NSLog("KarukanIME: failed to write request: \(error)")
-                self.takePending(id: id)?(nil)
+                self.takePending(
+                    id: id,
+                    sessionEpoch: requestEpoch,
+                    connectionEpoch: requestConnectionEpoch
+                )?.completion(nil)
             }
         }
         return id
@@ -157,13 +206,17 @@ class EngineClient {
         }
         if semaphore.wait(timeout: .now() + timeout) == .timedOut {
             NSLog("KarukanIME: \(method) timed out after \(timeout)s")
-            takePending(id: id)?(nil)
+            takePending(
+                id: id,
+                sessionEpoch: currentSessionEpoch(),
+                connectionEpoch: currentConnectionEpoch()
+            )?.completion(nil)
             return nil
         }
         return result
     }
 
-    private func handleResponse(_ lineData: Data) {
+    private func handleResponse(_ lineData: Data, connectionEpoch: UInt64) {
         guard
             let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
         else {
@@ -177,31 +230,105 @@ class EngineClient {
         }
         if let error = json["error"] as? [String: Any] {
             NSLog("KarukanIME: engine error for request \(id): \(error)")
-            takePending(id: id)?(nil)
+            takePending(
+                id: id,
+                sessionEpoch: currentSessionEpoch(),
+                connectionEpoch: connectionEpoch
+            )?.completion(nil)
             return
         }
         guard let result = json["result"],
             let data = try? JSONSerialization.data(withJSONObject: result)
         else {
-            takePending(id: id)?(nil)
+            takePending(
+                id: id,
+                sessionEpoch: currentSessionEpoch(),
+                connectionEpoch: connectionEpoch
+            )?.completion(nil)
             return
         }
-        takePending(id: id)?(data)
+        takePending(
+            id: id,
+            sessionEpoch: currentSessionEpoch(),
+            connectionEpoch: connectionEpoch
+        )?.completion(data)
     }
 
-    private func takePending(id: Int) -> ((Data?) -> Void)? {
+    private func takePending(
+        id: Int, sessionEpoch: UInt64, connectionEpoch: UInt64
+    ) -> PendingRequest? {
         lock.lock()
         defer { lock.unlock() }
+        guard let request = pendingRequests[id],
+            request.sessionEpoch == sessionEpoch,
+            request.connectionEpoch == connectionEpoch
+        else {
+            return nil
+        }
         return pendingRequests.removeValue(forKey: id)
     }
 
-    private func failAllPending() {
+    private func failAllPending(connectionEpoch: UInt64) {
         lock.lock()
-        let pending = pendingRequests
-        pendingRequests.removeAll()
-        lock.unlock()
-        for (_, completion) in pending {
-            completion(nil)
+        let pending = pendingRequests.filter { $0.value.connectionEpoch == connectionEpoch }
+        for (id, _) in pending {
+            pendingRequests.removeValue(forKey: id)
         }
+        lock.unlock()
+        for (_, request) in pending {
+            request.completion(nil)
+        }
+    }
+
+    private func currentSessionEpoch() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessionEpoch
+    }
+
+    private func currentConnectionEpoch() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return connectionEpoch
+    }
+
+    /// Advance the session before enqueuing the reset barrier. Pending old
+    /// responses are failed immediately, while already queued writes on the
+    /// same connection remain ahead of the reset request in FIFO order.
+    @discardableResult
+    private func advanceSessionEpoch() -> UInt64 {
+        lock.lock()
+        sessionEpoch &+= 1
+        let newEpoch = sessionEpoch
+        let stale = pendingRequests.filter { $0.value.sessionEpoch != newEpoch }
+        for (id, _) in stale {
+            pendingRequests.removeValue(forKey: id)
+        }
+        lock.unlock()
+
+        for (_, request) in stale {
+            request.completion(nil)
+        }
+
+        let barrierConnectionEpoch = currentConnectionEpoch()
+        requestQueue.async { [weak self] in
+            guard let self, self.isCurrentConnection(barrierConnectionEpoch) else { return }
+            // This no-op is an explicit FIFO barrier. Requests queued after
+            // advanceSessionEpoch cannot overtake it on requestQueue.
+        }
+        return newEpoch
+    }
+
+    private func beginNewSession() {
+        lock.lock()
+        connectionEpoch &+= 1
+        lock.unlock()
+        advanceSessionEpoch()
+    }
+
+    private func isCurrentConnection(_ epoch: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return connectionEpoch == epoch
     }
 }

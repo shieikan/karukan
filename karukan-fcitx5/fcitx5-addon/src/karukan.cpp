@@ -4,6 +4,8 @@
 
 #include "karukan.h"
 
+#include <time.h>
+
 #include <fcitx-utils/i18n.h>
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/utf8.h>
@@ -11,6 +13,10 @@
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 namespace fcitx {
+
+namespace {
+constexpr uint64_t kCompletionPollIntervalUsec = 16'000;
+}
 
 // X11 modifier bitmask constants matching the Rust FFI boundary (KeyModifiers::*_MASK).
 constexpr uint32_t kShiftMask = 1;    // ShiftMask
@@ -49,7 +55,8 @@ void KarukanCandidateWord::select(InputContext* inputContext) const {
 
 // --- KarukanCandidateList ---
 
-KarukanCandidateList::KarukanCandidateList(KarukanEngine* engine) : engine_(engine) {
+KarukanCandidateList::KarukanCandidateList(KarukanEngine* engine, InputContext* ic)
+    : engine_(engine), ic_(ic) {
     setLayoutHint(CandidateLayoutHint::Vertical);
     setPageSize(9);
     // Set selection key labels (1-9)
@@ -89,8 +96,50 @@ KarukanState::KarukanState(KarukanEngine* engine, InputContext* ic) : engine_(en
 }
 
 KarukanState::~KarukanState() {
+    cancelCompletionPoll();
     if (rustEngine_) {
         karukan_engine_free(rustEngine_);
+    }
+}
+
+void KarukanState::scheduleCompletionPoll() {
+    if (!rustEngine_) {
+        return;
+    }
+
+    const auto nextPoll = now(CLOCK_MONOTONIC) + kCompletionPollIntervalUsec;
+    if (completionPollEvent_) {
+        completionPollEvent_->setTime(nextPoll);
+        completionPollEvent_->setEnabled(true);
+        return;
+    }
+
+    completionPollEvent_ = engine_->instance()->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, nextPoll, 0,
+        [this](EventSourceTime* source, uint64_t) {
+            if (!rustEngine_) {
+                source->setEnabled(false);
+                return false;
+            }
+
+            if (karukan_engine_poll_async_conversion(rustEngine_)) {
+                updateUI();
+            }
+
+            if (!karukan_engine_has_pending_async_conversion(rustEngine_)) {
+                source->setEnabled(false);
+                return false;
+            }
+
+            source->setTime(now(CLOCK_MONOTONIC) + kCompletionPollIntervalUsec);
+            return true;
+        });
+}
+
+void KarukanState::cancelCompletionPoll() {
+    if (completionPollEvent_) {
+        completionPollEvent_->setEnabled(false);
+        completionPollEvent_.reset();
     }
 }
 
@@ -99,9 +148,11 @@ void KarukanState::keyEvent(KeyEvent& keyEvent) {
         return;
     }
 
-    // Initialize kanji converter on first use (model download + load may take time)
-    if (!engineInitialized_) {
-        // Show loading message before blocking init
+    // Queue model initialization on first use. The Rust worker owns model
+    // construction, so the Fcitx5 key handler stays responsive. A failed
+    // attempt leaves both readiness flags false and is retried on a later key.
+    if (!karukan_engine_is_ready(rustEngine_) &&
+        !karukan_engine_is_initializing(rustEngine_)) {
         {
             auto& inputPanel = ic_->inputPanel();
             Text aux;
@@ -112,18 +163,12 @@ void KarukanState::keyEvent(KeyEvent& keyEvent) {
         }
 
         int initResult = karukan_engine_init(rustEngine_);
-        engineInitialized_ = true;
 
-        // Clear loading message
-        {
+        if (initResult != 0) {
             auto& inputPanel = ic_->inputPanel();
-            if (initResult == 0) {
-                inputPanel.setAuxUp(Text());
-            } else {
-                Text aux;
-                aux.append("Karukan: Model load failed");
-                inputPanel.setAuxUp(aux);
-            }
+            Text aux;
+            aux.append("Karukan: Model load failed");
+            inputPanel.setAuxUp(aux);
             ic_->updatePreedit();
             ic_->updateUserInterface(UserInterfaceComponent::InputPanel);
         }
@@ -152,7 +197,15 @@ void KarukanState::keyEvent(KeyEvent& keyEvent) {
     // For apps without SurroundingText capability (terminals), this clears
     // the context so stale data doesn't persist.
     if (karukan_engine_is_empty(rustEngine_) && !isRelease) {
-        captureSurroundingText();
+        if (ic_->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
+            ic_->surroundingText().isValid()) {
+            const auto& surrounding = ic_->surroundingText();
+            const std::string& text = surrounding.text();
+            uint32_t cursor = surrounding.cursor();
+            karukan_engine_set_surrounding_text(rustEngine_, text.c_str(), cursor);
+        } else {
+            karukan_engine_set_surrounding_text(rustEngine_, "", 0);
+        }
     }
 
     // Process key through Rust engine
@@ -166,9 +219,13 @@ void KarukanState::keyEvent(KeyEvent& keyEvent) {
     // change engine state and produce UI actions. The has_* flags in the
     // Rust engine guard against unnecessary updates.
     updateUI();
+    if (karukan_engine_has_pending_async_conversion(rustEngine_)) {
+        scheduleCompletionPoll();
+    }
 }
 
 void KarukanState::reset() {
+    cancelCompletionPoll();
     if (rustEngine_) {
         karukan_engine_reset(rustEngine_);
     }
@@ -189,7 +246,10 @@ void KarukanState::updateUI() {
     // preedit/candidates/aux in one shot.
     // New preedit/candidates/aux are re-set below if the engine produced them.
     if (karukan_engine_has_commit(rustEngine_)) {
-        emitPendingCommit();
+        const char* commitText = karukan_engine_get_commit(rustEngine_);
+        if (commitText && karukan_engine_get_commit_len(rustEngine_) > 0) {
+            ic_->commitString(commitText);
+        }
         inputPanel.reset();
     }
 
@@ -231,7 +291,7 @@ void KarukanState::updateUI() {
         if (karukan_engine_should_hide_candidates(rustEngine_)) {
             inputPanel.setCandidateList(nullptr);
         } else {
-            auto candidateList = std::make_unique<KarukanCandidateList>(engine_);
+            auto candidateList = std::make_unique<KarukanCandidateList>(engine_, ic_);
             candidateList->updateCandidates(rustEngine_);
             inputPanel.setCandidateList(std::move(candidateList));
         }
@@ -239,25 +299,6 @@ void KarukanState::updateUI() {
 
     ic_->updatePreedit();
     ic_->updateUserInterface(UserInterfaceComponent::InputPanel);
-}
-
-void KarukanState::captureSurroundingText() {
-    if (ic_->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
-        ic_->surroundingText().isValid()) {
-        const auto& surrounding = ic_->surroundingText();
-        const std::string& text = surrounding.text();
-        uint32_t cursor = surrounding.cursor();
-        karukan_engine_set_surrounding_text(rustEngine_, text.c_str(), cursor);
-    } else {
-        karukan_engine_set_surrounding_text(rustEngine_, "", 0);
-    }
-}
-
-void KarukanState::emitPendingCommit() {
-    const char* commitText = karukan_engine_get_commit(rustEngine_);
-    if (commitText && karukan_engine_get_commit_len(rustEngine_) > 0) {
-        ic_->commitString(commitText);
-    }
 }
 
 // --- KarukanEngine ---
@@ -297,7 +338,15 @@ void KarukanEngine::activate(const InputMethodEntry& entry, InputContextEvent& e
     // Capture surrounding text on activation for accurate context.
     // For apps without SurroundingText capability, this clears the context.
     if (state->rustEngine()) {
-        state->captureSurroundingText();
+        if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
+            ic->surroundingText().isValid()) {
+            const auto& surrounding = ic->surroundingText();
+            const std::string& text = surrounding.text();
+            uint32_t cursor = surrounding.cursor();
+            karukan_engine_set_surrounding_text(state->rustEngine(), text.c_str(), cursor);
+        } else {
+            karukan_engine_set_surrounding_text(state->rustEngine(), "", 0);
+        }
     }
 }
 
@@ -311,7 +360,10 @@ void KarukanEngine::deactivate(const InputMethodEntry& entry, InputContextEvent&
     // This ensures preedit is not lost when Super/Windows key is pressed
     if (state->rustEngine()) {
         if (karukan_engine_commit(state->rustEngine())) {
-            state->emitPendingCommit();
+            const char* commitText = karukan_engine_get_commit(state->rustEngine());
+            if (commitText && karukan_engine_get_commit_len(state->rustEngine()) > 0) {
+                ic->commitString(commitText);
+            }
         }
         // Persist learning cache on deactivation (azooKey-style)
         karukan_engine_save_learning(state->rustEngine());
@@ -341,6 +393,9 @@ void KarukanEngine::selectCandidate(InputContext* ic, int index) {
     karukan_engine_process_key(rustEngine, keysym, 0, 0);
 
     state->updateUI();
+    if (karukan_engine_has_pending_async_conversion(rustEngine)) {
+        state->scheduleCompletionPoll();
+    }
 }
 
 }  // namespace fcitx

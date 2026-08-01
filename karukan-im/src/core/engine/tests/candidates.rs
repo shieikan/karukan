@@ -48,6 +48,8 @@ fn test_live_text_not_duplicated_in_conversion() {
         .filter(|c| c.text == "あい")
         .count();
     assert_eq!(count, 1, "Reading should appear exactly once");
+    assert_eq!(candidates.cursor(), 0);
+    assert_eq!(candidates.selected().unwrap().source_label.as_deref(), None);
 }
 
 #[test]
@@ -72,6 +74,30 @@ fn test_suggest_result_preserved_in_start_conversion() {
     assert!(
         candidates.candidates().iter().any(|c| c.text == "愛"),
         "Previous suggest result '愛' should be preserved in candidates"
+    );
+}
+
+#[test]
+fn test_live_conversion_is_first_selected_candidate_on_space() {
+    let mut engine = make_live_conversion_engine();
+    engine.process_key(&press('a'));
+    engine.process_key(&press('i'));
+    engine.live.text = "愛".to_string();
+
+    engine.process_key(&press_key(Keysym::SPACE));
+
+    let candidates = engine.candidates().unwrap();
+    let texts: Vec<&str> = candidates
+        .candidates()
+        .iter()
+        .map(|candidate| candidate.text.as_str())
+        .collect();
+    assert_eq!(&texts[..3], ["愛", "あい", "アイ"]);
+    assert_eq!(candidates.cursor(), 0);
+    assert_eq!(candidates.selected().unwrap().text, "愛");
+    assert_eq!(
+        candidates.selected().unwrap().source_label.as_deref(),
+        Some(CandidateSource::Model.label())
     );
 }
 

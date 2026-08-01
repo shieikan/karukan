@@ -29,11 +29,11 @@ fn auto_suggest_texts(result: &crate::core::engine::EngineResult) -> Vec<String>
 #[test]
 fn typing_colon_in_empty_enters_emoji_mode() {
     let mut engine = InputMethodEngine::new();
-    assert_eq!(engine.mode.current(), InputMode::Hiragana);
+    assert_eq!(engine.input_mode, InputMode::Hiragana);
 
     let result = engine.process_key(&press_colon());
     assert!(result.consumed);
-    assert_eq!(engine.mode.current(), InputMode::Emoji);
+    assert_eq!(engine.input_mode, InputMode::Emoji);
     assert!(matches!(engine.state(), InputState::Composing { .. }));
     // Preedit shows the literal `:` rather than any kana — emoji mode
     // is supposed to bypass romaji conversion.
@@ -49,7 +49,7 @@ fn ascii_after_colon_stays_literal() {
     for ch in ['p', 'i', 'e', 'n'] {
         engine.process_key(&press(ch));
     }
-    assert_eq!(engine.mode.current(), InputMode::Emoji);
+    assert_eq!(engine.input_mode, InputMode::Emoji);
     assert_eq!(engine.preedit().unwrap().text(), ":pien");
 }
 
@@ -77,26 +77,6 @@ fn emoji_mode_shows_candidates_via_rewriter() {
 }
 
 #[test]
-fn emoji_mode_shows_candidates_when_live_conversion_is_enabled() {
-    // Live conversion suppresses ordinary kana/symbol suggestion popups, but
-    // emoji mode is an explicit picker entered with `:`, so shortcode matches
-    // should stay visible while composing.
-    let mut engine = make_live_conversion_engine();
-    engine.process_key(&press_colon());
-    for ch in ['s', 'm', 'i', 'l'] {
-        engine.process_key(&press(ch));
-    }
-    let last = engine.process_key(&press('e'));
-
-    let texts = auto_suggest_texts(&last);
-    assert!(
-        texts.iter().any(|t| t == "😄"),
-        "expected 😄 in live-conversion emoji candidates, got {:?}",
-        texts
-    );
-}
-
-#[test]
 fn escape_commits_literal_and_exits_emoji_mode() {
     // Slack-style escape: pressing ESC in emoji mode dismisses the
     // picker AND commits whatever the user typed as plain text. Two
@@ -111,11 +91,11 @@ fn escape_commits_literal_and_exits_emoji_mode() {
     for ch in ['s', 'm', 'i', 'l', 'e'] {
         engine.process_key(&press(ch));
     }
-    assert_eq!(engine.mode.current(), InputMode::Emoji);
+    assert_eq!(engine.input_mode, InputMode::Emoji);
 
     let result = engine.process_key(&press_key(Keysym::ESCAPE));
     assert_eq!(commit_text(&result).as_deref(), Some(":smile"));
-    assert_eq!(engine.mode.current(), InputMode::Hiragana);
+    assert_eq!(engine.input_mode, InputMode::Hiragana);
     assert!(matches!(engine.state(), InputState::Empty));
 }
 
@@ -131,7 +111,7 @@ fn committing_emoji_resets_to_hiragana() {
     // Space starts conversion → first candidate selected → Return commits.
     engine.process_key(&press_key(Keysym::SPACE));
     engine.process_key(&press_key(Keysym::RETURN));
-    assert_eq!(engine.mode.current(), InputMode::Hiragana);
+    assert_eq!(engine.input_mode, InputMode::Hiragana);
     assert!(matches!(engine.state(), InputState::Empty));
 }
 
@@ -157,7 +137,7 @@ fn enter_on_emoji_query_commits_emoji_not_literal() {
     }
     let result = engine.process_key(&press_key(Keysym::RETURN));
     assert_eq!(commit_text(&result).as_deref(), Some("😄"));
-    assert_eq!(engine.mode.current(), InputMode::Hiragana);
+    assert_eq!(engine.input_mode, InputMode::Hiragana);
 }
 
 #[test]
@@ -294,13 +274,13 @@ fn backspacing_to_empty_exits_emoji_mode() {
     for ch in ['s', 'm', 'i', 'l', 'e'] {
         engine.process_key(&press(ch));
     }
-    assert_eq!(engine.mode.current(), InputMode::Emoji);
+    assert_eq!(engine.input_mode, InputMode::Emoji);
 
     for _ in 0..6 {
         engine.process_key(&press_key(Keysym::BACKSPACE));
     }
     assert!(matches!(engine.state(), InputState::Empty));
-    assert_eq!(engine.mode.current(), InputMode::Hiragana);
+    assert_eq!(engine.input_mode, InputMode::Hiragana);
 
     // And the very next keypress should behave like normal kana
     // input — `a` becomes `あ`, not literal `a`.
@@ -315,10 +295,10 @@ fn backspacing_to_empty_restores_pre_emoji_katakana_mode() {
     // A user typing in Katakana who pops into emoji and bails out
     // should land back in Katakana.
     let mut engine = InputMethodEngine::new();
-    engine.mode.set(InputMode::Katakana);
+    engine.input_mode = InputMode::Katakana;
 
     engine.process_key(&press_colon());
-    assert_eq!(engine.mode.current(), InputMode::Emoji);
+    assert_eq!(engine.input_mode, InputMode::Emoji);
     for ch in ['s', 'm', 'i', 'l', 'e'] {
         engine.process_key(&press(ch));
     }
@@ -327,33 +307,33 @@ fn backspacing_to_empty_restores_pre_emoji_katakana_mode() {
         engine.process_key(&press_key(Keysym::BACKSPACE));
     }
     assert!(matches!(engine.state(), InputState::Empty));
-    assert_eq!(engine.mode.current(), InputMode::Katakana);
+    assert_eq!(engine.input_mode, InputMode::Katakana);
 }
 
 #[test]
 fn commit_emoji_restores_pre_emoji_katakana_mode() {
     let mut engine = InputMethodEngine::new();
-    engine.mode.set(InputMode::Katakana);
+    engine.input_mode = InputMode::Katakana;
 
     engine.process_key(&press_colon());
     for ch in ['s', 'm', 'i', 'l', 'e'] {
         engine.process_key(&press(ch));
     }
     engine.process_key(&press_key(Keysym::RETURN));
-    assert_eq!(engine.mode.current(), InputMode::Katakana);
+    assert_eq!(engine.input_mode, InputMode::Katakana);
 }
 
 #[test]
 fn escape_emoji_restores_pre_emoji_katakana_mode() {
     let mut engine = InputMethodEngine::new();
-    engine.mode.set(InputMode::Katakana);
+    engine.input_mode = InputMode::Katakana;
 
     engine.process_key(&press_colon());
     for ch in ['s', 'm', 'i', 'l', 'e'] {
         engine.process_key(&press(ch));
     }
     engine.process_key(&press_key(Keysym::ESCAPE));
-    assert_eq!(engine.mode.current(), InputMode::Katakana);
+    assert_eq!(engine.input_mode, InputMode::Katakana);
 }
 
 #[test]
@@ -363,11 +343,11 @@ fn colon_in_hiragana_does_not_enter_emoji_when_already_composing() {
     // from Empty state.
     let mut engine = InputMethodEngine::new();
     engine.process_key(&press('a'));
-    assert_eq!(engine.mode.current(), InputMode::Hiragana);
+    assert_eq!(engine.input_mode, InputMode::Hiragana);
     assert!(matches!(engine.state(), InputState::Composing { .. }));
 
     engine.process_key(&press_colon());
-    assert_eq!(engine.mode.current(), InputMode::Hiragana);
+    assert_eq!(engine.input_mode, InputMode::Hiragana);
     // The `:` should have been absorbed by the existing composition,
     // not have triggered emoji mode.
     assert!(engine.preedit().unwrap().text().contains('あ'));

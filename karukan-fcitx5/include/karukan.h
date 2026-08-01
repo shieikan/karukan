@@ -25,9 +25,10 @@ typedef struct KarukanEngine KarukanEngine;
 KarukanEngine* karukan_engine_new(void);
 
 /*
- * Initialize the kanji converter (loads the neural network model).
- * This may take a few seconds on first call.
- * Returns 0 on success, -1 on failure.
+ * Queue kanji converter initialization (loads the neural network model on the
+ * worker thread). This call is non-blocking and safe to make again after a
+ * failed initialization attempt.
+ * Returns 0 when queued, -1 when settings are invalid.
  */
 int karukan_engine_init(KarukanEngine* engine);
 
@@ -56,6 +57,18 @@ int karukan_engine_process_key(
     uint32_t state,
     int is_release
 );
+
+/*
+ * Apply one completed async UI proposal without submitting another key.
+ * Returns 1 when actions were applied, 0 when no completion was ready.
+ */
+int karukan_engine_poll_async_conversion(KarukanEngine* engine);
+
+/*
+ * Check whether initialization, conversion, or an unpolled completion is
+ * pending and should keep the frontend's bounded poll timer alive.
+ */
+int karukan_engine_has_pending_async_conversion(const KarukanEngine* engine);
 
 /*
  * Reset the engine state, clearing any pending input.
@@ -209,6 +222,16 @@ void karukan_engine_save_learning(KarukanEngine* engine);
  * Returns 1 if empty, 0 if composing or converting.
  */
 int karukan_engine_is_empty(const KarukanEngine* engine);
+
+/*
+ * Check whether the most recent model initialization completed successfully.
+ */
+int karukan_engine_is_ready(const KarukanEngine* engine);
+
+/*
+ * Check whether model initialization is currently running.
+ */
+int karukan_engine_is_initializing(const KarukanEngine* engine);
 
 /* --- Focus handling --- */
 

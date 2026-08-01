@@ -81,11 +81,10 @@ impl Dictionary {
             .collect();
 
         let trie_bytes = DoubleArrayBuilder::build(&keyset)
-            .map_err(|e| DictError::Format(format!("failed to build double-array trie: {e}")))?;
+            .ok_or_else(|| DictError::Format("failed to build double-array trie".to_string()))?;
 
         Ok(Dictionary {
-            trie: DoubleArray::new(trie_bytes)
-                .map_err(|e| DictError::Format(format!("invalid double-array trie: {e}")))?,
+            trie: DoubleArray::new(trie_bytes),
             entries,
         })
     }
@@ -261,8 +260,7 @@ impl Dictionary {
         }
 
         Ok(Dictionary {
-            trie: DoubleArray::new(trie_bytes)
-                .map_err(|e| DictError::Format(format!("invalid double-array trie: {e}")))?,
+            trie: DoubleArray::new(trie_bytes),
             entries,
         })
     }
@@ -389,7 +387,11 @@ impl Dictionary {
         entries.dedup_by(|b, a| {
             if a.reading == b.reading {
                 // Merge candidates from b into a
-                extend_candidates_unique(&mut a.candidates, std::mem::take(&mut b.candidates));
+                for cand in std::mem::take(&mut b.candidates) {
+                    if !a.candidates.iter().any(|c| c.surface == cand.surface) {
+                        a.candidates.push(cand);
+                    }
+                }
                 true
             } else {
                 false
@@ -437,7 +439,11 @@ impl Dictionary {
                     reading_order.push(entry.reading.clone());
                 }
                 let candidates = merged.entry(entry.reading).or_default();
-                extend_candidates_unique(candidates, entry.candidates);
+                for cand in entry.candidates {
+                    if !candidates.iter().any(|c| c.surface == cand.surface) {
+                        candidates.push(cand);
+                    }
+                }
             }
         }
 
@@ -455,15 +461,6 @@ impl Dictionary {
         entries.sort_by(|a, b| a.reading.as_bytes().cmp(b.reading.as_bytes()));
 
         Self::build_from_entries(entries).map(Some)
-    }
-}
-
-/// Append candidates to `dst`, skipping any whose surface is already present.
-fn extend_candidates_unique(dst: &mut Vec<Candidate>, src: impl IntoIterator<Item = Candidate>) {
-    for cand in src {
-        if !dst.iter().any(|c| c.surface == cand.surface) {
-            dst.push(cand);
-        }
     }
 }
 
@@ -501,15 +498,6 @@ fn unescape_unicode(s: &str) -> String {
         }
     }
     result
-}
-
-/// Insert a (surface, cost) pair into a surfaces map, keeping the minimum cost
-/// for duplicate surfaces.
-fn insert_min_cost(surfaces: &mut HashMap<String, i32>, surface: String, cost: i32) {
-    let entry = surfaces.entry(surface).or_insert(cost);
-    if cost < *entry {
-        *entry = cost;
-    }
 }
 
 /// Parse a single Sudachi CSV file into a map of reading → {surface → min_cost}.
@@ -561,7 +549,10 @@ pub fn parse_sudachi_csv(path: &Path) -> Result<HashMap<String, HashMap<String, 
         }
 
         let surfaces = map.entry(reading).or_default();
-        insert_min_cost(surfaces, surface, cost);
+        let entry = surfaces.entry(surface).or_insert(cost);
+        if cost < *entry {
+            *entry = cost;
+        }
     }
 
     Ok(map)
@@ -584,14 +575,17 @@ pub fn parse_sudachi_csvs(
 }
 
 /// Merge `source` reading map into `target`, keeping minimum costs.
-fn merge_reading_maps(
+pub fn merge_reading_maps(
     target: &mut HashMap<String, HashMap<String, i32>>,
     source: HashMap<String, HashMap<String, i32>>,
 ) {
     for (reading, surfaces) in source {
         let target_surfaces = target.entry(reading).or_default();
         for (surface, cost) in surfaces {
-            insert_min_cost(target_surfaces, surface, cost);
+            let entry = target_surfaces.entry(surface).or_insert(cost);
+            if cost < *entry {
+                *entry = cost;
+            }
         }
     }
 }

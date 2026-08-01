@@ -13,15 +13,15 @@ pub extern "C" fn karukan_engine_new() -> *mut KarukanEngine {
     Box::into_raw(engine)
 }
 
-/// Initialize the kanji converter (loads the model)
-/// Returns 0 on success, -1 on failure
+/// Queue kanji-converter initialization without blocking the key handler.
+/// Returns 0 when the request was accepted, -1 when settings are invalid.
 #[unsafe(no_mangle)]
 pub extern "C" fn karukan_engine_init(engine: *mut KarukanEngine) -> c_int {
     let engine = ffi_mut!(engine, -1);
-    match engine.engine.init_from_settings(&engine.settings) {
+    match engine.engine.begin_init_from_settings(&engine.settings) {
         Ok(()) => 0,
         Err(e) => {
-            tracing::error!("Karukan init failed: {:#}", e);
+            tracing::error!("Karukan init request failed: {:#}", e);
             -1
         }
     }
