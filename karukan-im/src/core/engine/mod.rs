@@ -32,6 +32,10 @@ use super::preedit::{AttributeType, Preedit, PreeditAttribute, PreeditSegment};
 use super::state::InputState;
 use crate::config::settings::Settings;
 
+/// Start automatic live conversion only after this many reading characters.
+/// Shorter readings remain available to explicit conversion.
+const MIN_LIVE_CONVERSION_READING_CHARS: usize = 3;
+
 /// Source of a conversion candidate
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CandidateSource {
@@ -164,6 +168,8 @@ pub struct InputMethodEngine {
     generation: u64,
     /// Epoch for the proposed chunk cache.
     chunk_cache_epoch: u64,
+    /// Minimum reading length before automatic live conversion starts.
+    min_live_conversion_reading_chars: usize,
 }
 
 impl InputMethodEngine {
@@ -192,6 +198,7 @@ impl InputMethodEngine {
             pending_async_request: None,
             generation: 0,
             chunk_cache_epoch: 0,
+            min_live_conversion_reading_chars: MIN_LIVE_CONVERSION_READING_CHARS,
         }
     }
 
@@ -301,6 +308,8 @@ impl InputMethodEngine {
             async_conversion::AsyncConversionWorker::with_backend(backend),
         );
         engine.live.enabled = true;
+        // Existing worker-boundary tests intentionally use two-kana inputs.
+        engine.min_live_conversion_reading_chars = 2;
         engine
     }
 
@@ -310,6 +319,8 @@ impl InputMethodEngine {
             async_conversion::AsyncConversionWorker::with_backend_factory(factory),
         );
         engine.live.enabled = true;
+        // Existing worker-boundary tests intentionally use two-kana inputs.
+        engine.min_live_conversion_reading_chars = 2;
         engine
     }
 

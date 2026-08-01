@@ -921,6 +921,30 @@ fn wait_for_engine_completion(engine: &mut InputMethodEngine) -> EngineResult {
 }
 
 #[test]
+fn live_conversion_starts_at_three_characters_and_updates_preedit() {
+    let mut engine = InputMethodEngine::with_test_backend(Box::new(FixedCandidatesBackend {
+        candidates: vec!["自動変換".to_string()],
+    }));
+    engine.min_live_conversion_reading_chars = 3;
+
+    for ch in "ai".chars() {
+        engine.process_key(&press(ch));
+    }
+    assert_eq!(engine.input_buf.text, "あい");
+    assert!(engine.pending_async_request.is_none());
+
+    engine.process_key(&press('u'));
+    assert_eq!(engine.input_buf.text, "あいう");
+    assert!(engine.pending_async_request.is_some());
+
+    let result = wait_for_engine_completion(&mut engine);
+    assert_eq!(engine.live.text, "自動変換");
+    assert!(result.actions.iter().any(
+        |action| matches!(action, EngineAction::UpdatePreedit(preedit) if preedit.text() == "自動変換")
+    ));
+}
+
+#[test]
 fn core_host_loop_polls_delayed_auto_and_explicit_without_new_key() {
     let mut engine = InputMethodEngine::with_test_backend(Box::new(DelayedBackend {
         delay: Duration::from_millis(20),

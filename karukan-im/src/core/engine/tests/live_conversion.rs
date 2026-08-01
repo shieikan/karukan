@@ -36,6 +36,25 @@ fn test_live_conversion_enabled() {
 }
 
 #[test]
+fn test_live_conversion_waits_for_three_reading_characters() {
+    let mut engine = make_live_conversion_engine();
+
+    for ch in "kore".chars() {
+        engine.process_key(&press(ch));
+    }
+    assert_eq!(engine.input_buf.text, "これ");
+    assert!(engine.pending_async_request.is_none());
+    assert!(engine.chunks.is_empty());
+
+    for ch in "mo".chars() {
+        engine.process_key(&press(ch));
+    }
+    assert_eq!(engine.input_buf.text, "これも");
+    assert!(engine.pending_async_request.is_some());
+    assert!(!engine.chunks.is_empty());
+}
+
+#[test]
 fn test_live_conversion_suppresses_candidates_until_explicit_conversion() {
     let mut engine = make_live_conversion_engine();
 

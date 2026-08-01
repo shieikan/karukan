@@ -40,7 +40,11 @@ impl InputMethodEngine {
         // this is identical to a whole-buffer call. Its immediate projection is
         // the reused converted prefix plus raw text for the changed chunk, so a
         // pending request never makes the entire preedit oscillate back to raw.
+        let live_reading_is_long_enough = !self.live.enabled
+            || !matches!(self.input_mode, InputMode::Hiragana | InputMode::Alphabet)
+            || self.input_buf.text.chars().count() >= self.min_live_conversion_reading_chars;
         let convert = !self.input_buf.text.is_empty()
+            && live_reading_is_long_enough
             && (self.input_mode != InputMode::Alphabet
                 || karukan_engine::contains_kana(&self.input_buf.text));
         let projected_live_text = if convert {
