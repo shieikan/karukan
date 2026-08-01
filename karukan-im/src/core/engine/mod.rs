@@ -567,7 +567,7 @@ impl InputMethodEngine {
 
         let shift_active = key.modifiers.shift_key;
 
-        let key_result = match &self.state {
+        let mut result = match &self.state {
             InputState::Empty => self.process_key_empty(key, shift_active),
             InputState::Composing { .. } => self.process_key_composing(key, shift_active),
             InputState::Conversion { .. } => self.process_key_conversion(key),
@@ -576,13 +576,15 @@ impl InputMethodEngine {
         // input/state invalidates the old ready completion before this poll;
         // pass-through keys leave the snapshot unchanged and can still apply
         // its UI actions without changing the key's consumed status.
-        let mut result = self
-            .poll_async_conversion()
-            .unwrap_or_else(EngineResult::not_consumed);
-        result.actions.extend(key_result.actions);
+        if let Some(completion_result) = self.poll_async_conversion() {
+            // The key's immediate/raw projection must be applied first. If the
+            // newly submitted snapshot completed fast enough on this same
+            // boundary, its converted projection is the newest display state
+            // and therefore has to be applied last.
+            result.actions.extend(completion_result.actions);
+        }
         // Completion UI updates are not input events. Only the current key
         // operation decides whether this boundary consumes the key.
-        result.consumed = key_result.consumed;
 
         self.metrics.process_key_ms = start.elapsed().as_millis() as u64;
 
