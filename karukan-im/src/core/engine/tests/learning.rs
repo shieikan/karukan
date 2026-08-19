@@ -304,6 +304,40 @@ fn init_learning_cache_applies_configured_surface_cap() {
 }
 
 #[test]
+fn save_learning_prunes_clean_loaded_expired_singleton() {
+    const DAY: u64 = 86_400;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("learning.tsv");
+    std::fs::write(
+        &path,
+        format!(
+            "# karukan learning cache v1\nreading\texpired_surface\t1\t{}\n",
+            now - 8 * DAY
+        ),
+    )
+    .unwrap();
+
+    let config = LearningConfig {
+        singleton_ttl_days: 7,
+        ..config_with(100)
+    };
+    let cache = LearningCache::load(&path, config).unwrap();
+    assert!(!cache.is_dirty());
+    assert!(cache.needs_save_at(now));
+    assert!(cache.needs_save());
+
+    let mut engine = engine_with_cache(cache);
+    engine.save_learning_to_path(&path);
+
+    let persisted = LearningCache::load(&path, config).unwrap();
+    assert_eq!(persisted.entry_count(), 0);
+}
+
+#[test]
 fn ctrl_backspace_deletes_learning_entry_like_ctrl_delete() {
     // Mac keyboards label the Backspace key "delete", so the natural macOS
     // chord is Ctrl+delete = Ctrl+Backspace; it must behave like Ctrl+Delete

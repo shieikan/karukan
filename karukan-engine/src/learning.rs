@@ -293,6 +293,28 @@ impl LearningCache {
         self.dirty
     }
 
+    /// Whether saving is needed because the cache changed or a singleton has
+    /// expired under the current wall clock.
+    pub fn needs_save(&self) -> bool {
+        self.needs_save_at(now_unix())
+    }
+
+    /// Deterministic counterpart to [`needs_save`](Self::needs_save).
+    pub fn needs_save_at(&self, now: u64) -> bool {
+        if self.dirty {
+            return true;
+        }
+
+        let Some(ttl_seconds) = self.singleton_ttl_seconds() else {
+            return false;
+        };
+        self.entries.values().any(|entries| {
+            entries
+                .iter()
+                .any(|entry| singleton_expired(entry, now, ttl_seconds))
+        })
+    }
+
     /// Total number of (reading, surface) pairs across all readings.
     pub fn entry_count(&self) -> usize {
         self.entries.values().map(|v| v.len()).sum()
@@ -341,23 +363,28 @@ impl LearningCache {
 
     /// Remove expired singleton entries before applying the capacity limit.
     fn prune_expired_singletons(&mut self, now: u64) {
-        let ttl_days = self.singleton_ttl_days;
-        if ttl_days == 0 {
+        let Some(ttl_seconds) = self.singleton_ttl_seconds() else {
             return;
-        }
+        };
 
-        let ttl_seconds = ttl_days.saturating_mul(SECONDS_PER_DAY);
         self.entries.retain(|_, entries| {
-            entries.retain(|entry| {
-                entry.frequency != 1 || now.saturating_sub(entry.last_access) <= ttl_seconds
-            });
+            entries.retain(|entry| !singleton_expired(entry, now, ttl_seconds));
             !entries.is_empty()
         });
+    }
+
+    fn singleton_ttl_seconds(&self) -> Option<u64> {
+        (self.singleton_ttl_days != 0)
+            .then(|| self.singleton_ttl_days.saturating_mul(SECONDS_PER_DAY))
     }
 }
 
 const MAX_TEMPORARY_FILE_ATTEMPTS: usize = 16;
 const SECONDS_PER_DAY: u64 = 86_400;
+
+fn singleton_expired(entry: &LearningEntry, now: u64, ttl_seconds: u64) -> bool {
+    entry.frequency == 1 && now.saturating_sub(entry.last_access) > ttl_seconds
+}
 
 fn normalized_parent_dir(path: &Path) -> &Path {
     match path.parent() {

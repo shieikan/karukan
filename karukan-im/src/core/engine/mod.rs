@@ -18,6 +18,7 @@ mod types;
 pub use types::*;
 
 use input_buffer::InputBuffer;
+use std::path::Path;
 use std::thread::JoinHandle;
 
 #[cfg(test)]
@@ -621,17 +622,23 @@ impl InputMethodEngine {
             .with_action(EngineAction::HideAuxText)
     }
 
-    /// Save the learning cache to disk if it has unsaved changes.
-    pub fn save_learning(&mut self) {
+    fn save_learning_to_path(&mut self, path: &Path) {
         if let Some(cache) = &mut self.learning
-            && cache.is_dirty()
-            && let Some(path) = Settings::learning_file()
+            && cache.needs_save()
         {
-            if let Err(e) = cache.save(&path) {
+            if let Err(e) = cache.save(path) {
                 debug!("Failed to save learning cache: {}", e);
             } else {
                 debug!("Learning cache saved to {:?}", path);
             }
+        }
+    }
+
+    /// Save the learning cache to disk if it has unsaved changes or expired
+    /// singleton entries.
+    pub fn save_learning(&mut self) {
+        if let Some(path) = Settings::learning_file() {
+            self.save_learning_to_path(&path);
         }
     }
 }
