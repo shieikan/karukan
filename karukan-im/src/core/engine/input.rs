@@ -44,10 +44,15 @@ impl InputMethodEngine {
                 self.mode.current(),
                 InputMode::Hiragana | InputMode::Alphabet
             );
+        let reading = self.input_buf.text.clone();
+        let live_override = defer_live_candidates
+            .then(|| self.resolve_live_override(&reading))
+            .flatten();
 
         if self.live.enabled
             && self.mode.current() == InputMode::Hiragana
             && self.input_buf.text.chars().count() < LIVE_CONVERSION_MIN_READING_CHARS
+            && live_override.is_none()
         {
             self.live.text.clear();
             self.chunks.clear();
@@ -58,7 +63,10 @@ impl InputMethodEngine {
                 .with_action(EngineAction::UpdateAuxText(self.format_aux_composing()));
         }
 
-        if convert {
+        if let Some(live_override) = &live_override {
+            self.chunks.clear();
+            self.live.text = live_override.text(&reading).to_string();
+        } else if convert {
             let converted = self.chunked_auto_suggest();
             if defer_live_candidates {
                 self.live.text = converted.unwrap_or_default();
@@ -70,7 +78,6 @@ impl InputMethodEngine {
 
         // Synchronous fallback candidates are always available without model
         // work. Model candidates are appended by the matching worker poll.
-        let reading = self.input_buf.text.clone();
         let preedit = self.set_composing_state();
         let mut all_candidates = self.lookup_learning_candidates(&reading);
         append_candidates_dedup(&mut all_candidates, self.lookup_dict_candidates(&reading));
@@ -89,7 +96,7 @@ impl InputMethodEngine {
                     all_candidates,
                 )));
         }
-        if convert {
+        if convert && live_override.is_none() {
             self.submit_async_conversion(async_conversion::AsyncRequestKind::AutoSuggest, false);
         }
         result

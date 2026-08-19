@@ -8,7 +8,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use karukan_engine::Dictionary;
+use karukan_engine::{Dictionary, LearningCache, LearningConfig};
 
 use super::*;
 use crate::core::engine::async_conversion::{BackendFactory, ConversionBackend};
@@ -670,6 +670,114 @@ fn user_dict_with_surfaces(reading: &str, surfaces: &[&str]) -> Dictionary {
     tmp.write_all(json.as_bytes()).unwrap();
     tmp.flush().unwrap();
     Dictionary::build_from_json(tmp.path()).unwrap()
+}
+
+fn live_text_after_refresh(engine: &mut InputMethodEngine) -> String {
+    let _ = engine.refresh_input_state();
+    if engine.has_pending_async_conversion() {
+        let _ = wait_for_engine_completion(engine);
+    }
+    engine.live.text.clone()
+}
+
+#[test]
+fn live_user_dictionary_override_beats_model() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = InputMethodEngine::with_test_backend(Box::new(MappedBackend {
+        mappings: Vec::new(),
+        calls: Arc::clone(&calls),
+    }));
+    engine.dicts.user = Some(user_dict_with_surfaces("わとそん", &["Watson"]));
+    engine.input_buf.insert("わとそん");
+
+    let live = live_text_after_refresh(&mut engine);
+
+    assert_eq!(live, "Watson");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn live_verbatim_user_dictionary_entry_vetoes_model() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = InputMethodEngine::with_test_backend(Box::new(MappedBackend {
+        mappings: Vec::new(),
+        calls: Arc::clone(&calls),
+    }));
+    engine.dicts.user = Some(user_dict_with_surfaces("ちさちゃん", &["ちさちゃん"]));
+    engine.input_buf.insert("ちさちゃん");
+
+    let live = live_text_after_refresh(&mut engine);
+
+    assert_eq!(live, "ちさちゃん");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn live_learning_requires_two_confirmations() {
+    let mut one_use = InputMethodEngine::with_test_backend(Box::new(MappedBackend {
+        mappings: Vec::new(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }));
+    let mut one_use_cache = LearningCache::new(LearningConfig::default());
+    one_use_cache.record("あいう", "選択");
+    one_use.learning = Some(one_use_cache);
+    one_use.input_buf.insert("あいう");
+    assert!(live_text_after_refresh(&mut one_use).starts_with("model:"));
+
+    let mut two_uses = InputMethodEngine::with_test_backend(Box::new(MappedBackend {
+        mappings: Vec::new(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }));
+    let mut two_use_cache = LearningCache::new(LearningConfig::default());
+    two_use_cache.record("あいう", "選択");
+    two_use_cache.record("あいう", "選択");
+    two_uses.learning = Some(two_use_cache);
+    two_uses.input_buf.insert("あいう");
+    assert_eq!(live_text_after_refresh(&mut two_uses), "選択");
+}
+
+#[test]
+fn live_exact_dictionary_mapping_stops_when_input_grows() {
+    let mut engine = InputMethodEngine::with_test_backend(Box::new(MappedBackend {
+        mappings: Vec::new(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }));
+    engine.dicts.user = Some(user_dict_with_surfaces("わとそ", &["短縮"]));
+    engine.input_buf.insert("わとそ");
+    assert_eq!(live_text_after_refresh(&mut engine), "短縮");
+
+    engine.input_buf.insert("ん");
+    assert!(live_text_after_refresh(&mut engine).starts_with("model:"));
+}
+
+#[test]
+fn delayed_model_completion_cannot_overwrite_live_dictionary_override() {
+    let gate = Arc::new(SynchronizedGate {
+        started_calls: AtomicUsize::new(0),
+        released_calls: AtomicUsize::new(0),
+        completed_calls: AtomicUsize::new(0),
+    });
+    let mut engine = InputMethodEngine::with_test_backend(Box::new(SynchronizedDelayedBackend {
+        gate: Arc::clone(&gate),
+    }));
+    let _release_guard = SynchronizedReleaseGuard::new(Arc::clone(&gate));
+
+    engine.process_key(&press('a'));
+    engine.process_key(&press('i'));
+    engine.process_key(&press('u'));
+    wait_until(|| gate.started_calls.load(Ordering::SeqCst) == 1);
+    engine.dicts.user = Some(user_dict_with_surfaces("あいう", &["確定"]));
+
+    gate.released_calls.store(1, Ordering::SeqCst);
+    let _ = wait_for_engine_completion(&mut engine);
+
+    assert_eq!(engine.live.text, "確定");
+
+    // Once the exact override no longer matches, forward projection must not
+    // resurrect the model surface cached by the delayed completion.
+    engine.input_buf.insert("え");
+    let _ = engine.refresh_input_state();
+    assert!(!engine.live.text.contains("converted:アイウ"));
 }
 
 type CandidateFingerprint = (String, Option<String>, Option<String>, Option<String>);
@@ -1845,17 +1953,17 @@ fn delayed_counter_auto_completion_preserves_candidates_selection_and_page_ident
             delay: Duration::from_millis(25),
             started: Arc::clone(&started),
         }));
+    type_counter(&mut engine);
+    wait_until(|| started.load(Ordering::SeqCst));
+    let _ = wait_for_engine_completion(&mut engine);
+    assert_eq!(engine.live.text, "10件");
+
     engine.dicts.user = Some(user_dict_with_surfaces(
         "10けん",
         &[
             "辞書00", "辞書01", "辞書02", "辞書03", "辞書04", "辞書05", "辞書06", "辞書07",
         ],
     ));
-
-    type_counter(&mut engine);
-    wait_until(|| started.load(Ordering::SeqCst));
-    let _ = wait_for_engine_completion(&mut engine);
-    assert_eq!(engine.live.text, "10件");
 
     started.store(false, Ordering::SeqCst);
     let _ = engine.process_key(&press_key(Keysym::SPACE));

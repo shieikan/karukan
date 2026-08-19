@@ -8,6 +8,22 @@ use super::*;
 /// Maximum number of learning candidates to show
 const MAX_LEARNING_CANDIDATES: usize = 3;
 
+/// An exact live-conversion result selected before asking the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LiveOverride {
+    Surface(String),
+    Verbatim,
+}
+
+impl LiveOverride {
+    pub(super) fn text<'a>(&'a self, reading: &'a str) -> &'a str {
+        match self {
+            Self::Surface(surface) => surface,
+            Self::Verbatim => reading,
+        }
+    }
+}
+
 pub(super) fn is_pure_script_variant(text: &str, reading: &str) -> bool {
     karukan_engine::is_pure_hiragana(reading)
         && (text == reading
@@ -259,6 +275,33 @@ impl InputMethodEngine {
         }
 
         candidates
+    }
+
+    /// Resolve a live result for one completed reading.
+    ///
+    /// User-dictionary entries are explicit intent and therefore win over
+    /// confirmed learning entries. A same-surface user entry is retained as
+    /// a deliberate verbatim veto. Both sources are exact-reading only.
+    pub(super) fn resolve_live_override(&self, reading: &str) -> Option<LiveOverride> {
+        if let Some(dict) = &self.dicts.user
+            && let Some(result) = dict.exact_match_search(reading)
+        {
+            if result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.surface == reading)
+            {
+                return Some(LiveOverride::Verbatim);
+            }
+            if let Some(candidate) = result.candidates.first() {
+                return Some(LiveOverride::Surface(candidate.surface.clone()));
+            }
+        }
+
+        self.learning
+            .as_ref()
+            .and_then(|cache| cache.lookup_min_frequency(reading, 2).into_iter().next())
+            .map(|(surface, _score)| LiveOverride::Surface(surface))
     }
 
     /// Build conversion candidates for a reading from multiple sources.

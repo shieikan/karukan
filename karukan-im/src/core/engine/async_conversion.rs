@@ -827,8 +827,18 @@ impl super::InputMethodEngine {
     }
 
     fn apply_auto_completion(&mut self, completion: ProposedCompletion) -> super::EngineResult {
-        self.chunks = completion.chunk_cache;
         let reading = completion.snapshot.reading;
+        let live_override = self.resolve_live_override(&reading);
+        let defer_live_candidates = self.live.enabled
+            && matches!(
+                self.mode.current(),
+                super::InputMode::Hiragana | super::InputMode::Alphabet
+            );
+        self.chunks = if defer_live_candidates && live_override.is_some() {
+            Vec::new()
+        } else {
+            completion.chunk_cache
+        };
         let model_candidates: Vec<super::Candidate> = completion
             .model_candidates
             .into_iter()
@@ -846,14 +856,14 @@ impl super::InputMethodEngine {
         append_candidates_dedup(&mut all_candidates, self.lookup_dict_candidates(&reading));
         append_candidates_dedup(&mut all_candidates, self.lookup_rewriter_variants(&reading));
 
-        let defer_live_candidates = self.live.enabled
-            && matches!(
-                self.mode.current(),
-                super::InputMode::Hiragana | super::InputMode::Alphabet
-            );
         if defer_live_candidates {
-            self.live.text = karukan_engine::rewriter::NumberRewriter::new()
-                .preferred_decimal_counter_surface(&reading)
+            self.live.text = live_override
+                .as_ref()
+                .map(|live_override| live_override.text(&reading).to_string())
+                .or_else(|| {
+                    karukan_engine::rewriter::NumberRewriter::new()
+                        .preferred_decimal_counter_surface(&reading)
+                })
                 .or_else(|| {
                     model_candidates
                         .first()

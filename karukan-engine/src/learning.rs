@@ -143,6 +143,22 @@ impl LearningCache {
         scored
     }
 
+    /// Exact-match lookup restricted to entries at or above `min_frequency`.
+    /// Results retain the same score ordering as [`Self::lookup`].
+    pub fn lookup_min_frequency(&self, reading: &str, min_frequency: u32) -> Vec<(String, f64)> {
+        let now = now_unix();
+        let Some(entries) = self.entries.get(reading) else {
+            return Vec::new();
+        };
+        let mut scored: Vec<(String, f64)> = entries
+            .iter()
+            .filter(|entry| entry.frequency >= min_frequency)
+            .map(|entry| (entry.surface.clone(), score(entry, now)))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored
+    }
+
     /// Prefix-match lookup: returns `(reading, surface, score)` triples
     /// for all readings that start with `prefix`, sorted by score descending.
     pub fn prefix_lookup(&self, prefix: &str) -> Vec<(String, String, f64)> {
@@ -501,6 +517,35 @@ mod tests {
         let cache = cache_with(100);
         let results = cache.lookup("きょう");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn lookup_min_frequency_filters_singletons_and_preserves_score_order() {
+        let now = now_unix();
+        let mut cache = cache_with(100);
+        cache.entries.insert(
+            "reading".to_string(),
+            vec![
+                entry("one-use", 1, now),
+                entry("confirmed-old", 3, now.saturating_sub(DAY)),
+                entry("confirmed-new", 2, now),
+            ],
+        );
+
+        let expected: Vec<String> = cache
+            .lookup("reading")
+            .into_iter()
+            .filter(|(surface, _)| surface != "one-use")
+            .map(|(surface, _)| surface)
+            .collect();
+        let actual: Vec<String> = cache
+            .lookup_min_frequency("reading", 2)
+            .into_iter()
+            .map(|(surface, _)| surface)
+            .collect();
+
+        assert_eq!(actual, expected);
+        assert!(cache.lookup_min_frequency("missing", 2).is_empty());
     }
 
     #[test]
