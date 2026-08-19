@@ -83,6 +83,8 @@ pub struct LearningSettings {
     /// cache; longer conversion results (e.g. whole live-converted
     /// sentences) are not learned
     pub max_surface_chars: usize,
+    /// Whole-day TTL for singleton entries; 0 disables TTL pruning
+    pub singleton_ttl_days: u64,
 }
 
 impl Default for Settings {
@@ -214,6 +216,7 @@ mod tests {
         assert!(settings.learning.enabled);
         assert_eq!(settings.learning.max_entries, 10000);
         assert_eq!(settings.learning.max_surface_chars, 50);
+        assert_eq!(settings.learning.singleton_ttl_days, 7);
     }
 
     #[test]
@@ -233,6 +236,23 @@ max_surface_chars = 10
         assert_eq!(settings.learning.max_surface_chars, 10);
         assert!(settings.learning.enabled);
         assert_eq!(settings.learning.max_entries, 10000);
+        assert_eq!(settings.learning.singleton_ttl_days, 7);
+    }
+
+    #[test]
+    fn test_learning_singleton_ttl_zero_is_supported() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[learning]
+singleton_ttl_days = 0
+"#
+        )
+        .unwrap();
+
+        let settings = Settings::load_from(file.path()).unwrap();
+        assert_eq!(settings.learning.singleton_ttl_days, 0);
     }
 
     #[test]

@@ -216,6 +216,7 @@ impl InputMethodEngine {
                         LearningConfig {
                             max_entries: settings.learning.max_entries,
                             max_surface_chars: settings.learning.max_surface_chars,
+                            singleton_ttl_days: settings.learning.singleton_ttl_days,
                         },
                     )
                 })

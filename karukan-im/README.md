@@ -84,6 +84,7 @@ dict_path = "/path/to/dict.bin" # システム辞書パス（省略時はデー�
 enabled = true                 # 変換学習の有効/無効
 max_entries = 10000            # 学習エントリの最大数
 max_surface_chars = 50         # 学習する変換結果の最大文字数
+singleton_ttl_days = 7         # frequency=1を保持する経過日数（0 = TTL pruning無効、境界日数は保持）
 ```
 
 > [!NOTE]
@@ -173,6 +174,8 @@ cp dict.bin ~/Library/"Application Support"/com.karukan.karukan-im/
 - 学習候補は変換時・入力中（auto-suggest）の両方で最大3件表示
 - スコアはrecency（最終使用日時）重視 + 頻度補正
 - 50文字（`max_surface_chars`）を超える変換結果は学習しない
+- `frequency == 1` のエントリは、最終使用から7日を超えると保存時に削除（ちょうど7日は保持）
+- `singleton_ttl_days = 0` でこの期限削除を無効化。`frequency >= 2` のエントリは年齢に関係なく保持
 - 変換中に学習候補（📝）を選択して `Ctrl+Backspace`（macOSでは Ctrl+delete。`Ctrl+Delete` でも可）を押すと、そのエントリを学習履歴から削除できる。学習候補の選択中はフッターに「Ctrl+Backspaceで履歴から削除」と表示される
 - IME切り替え・ウィンドウ切り替え時に自動保存（commit のたびには保存しない）
 - `[learning] enabled = false` で無効化可能

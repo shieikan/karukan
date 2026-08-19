@@ -288,6 +288,7 @@ fn init_learning_cache_applies_configured_surface_cap() {
         LearningConfig {
             max_entries: 10_000,
             max_surface_chars: 5,
+            ..LearningConfig::default()
         },
     );
     let cache = engine.learning.as_mut().expect("learning enabled");

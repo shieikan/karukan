@@ -34,6 +34,8 @@ pub struct LearningConfig {
     /// accepts. Keeps whole-sentence live-conversion commits — one-off text
     /// that never matches again — out of the cache.
     pub max_surface_chars: usize,
+    /// Whole-day TTL for frequency-one entries; zero disables TTL pruning.
+    pub singleton_ttl_days: u64,
 }
 
 impl LearningConfig {
@@ -41,6 +43,8 @@ impl LearningConfig {
     pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
     /// Default for [`max_surface_chars`](Self::max_surface_chars).
     pub const DEFAULT_MAX_SURFACE_CHARS: usize = 50;
+    /// Default number of whole days before an unused singleton expires.
+    pub const DEFAULT_SINGLETON_TTL_DAYS: u64 = 7;
 }
 
 impl Default for LearningConfig {
@@ -48,6 +52,7 @@ impl Default for LearningConfig {
         Self {
             max_entries: Self::DEFAULT_MAX_ENTRIES,
             max_surface_chars: Self::DEFAULT_MAX_SURFACE_CHARS,
+            singleton_ttl_days: Self::DEFAULT_SINGLETON_TTL_DAYS,
         }
     }
 }
@@ -61,6 +66,7 @@ pub struct LearningCache {
     entries: HashMap<String, Vec<LearningEntry>>,
     max_entries: usize,
     max_surface_chars: usize,
+    singleton_ttl_days: u64,
     dirty: bool,
 }
 
@@ -71,6 +77,7 @@ impl LearningCache {
             entries: HashMap::new(),
             max_entries: config.max_entries,
             max_surface_chars: config.max_surface_chars,
+            singleton_ttl_days: config.singleton_ttl_days,
             dirty: false,
         }
     }
@@ -205,12 +212,24 @@ impl LearningCache {
         })
     }
 
-    /// Save through a same-directory temporary file and atomically rename it.
-    ///
-    /// The rename operation is injected so tests can deterministically prove
-    /// that a failed replacement leaves both destination bytes and live cache
-    /// state untouched.
+    /// Save the cache with an injected timestamp for deterministic tests.
+    #[cfg(test)]
+    fn save_at(&mut self, path: &Path, now: u64) -> anyhow::Result<()> {
+        self.save_with_rename_at(path, now, |temporary, destination| {
+            std::fs::rename(temporary, destination)
+        })
+    }
+
+    /// Save through a same-directory temporary file using the current time.
     fn save_with_rename<R>(&mut self, path: &Path, rename: R) -> anyhow::Result<()>
+    where
+        R: Fn(&Path, &Path) -> std::io::Result<()>,
+    {
+        self.save_with_rename_at(path, now_unix(), rename)
+    }
+
+    /// Save through a same-directory temporary file with an injected time.
+    fn save_with_rename_at<R>(&mut self, path: &Path, now: u64, rename: R) -> anyhow::Result<()>
     where
         R: Fn(&Path, &Path) -> std::io::Result<()>,
     {
@@ -221,9 +240,11 @@ impl LearningCache {
             entries: self.entries.clone(),
             max_entries: self.max_entries,
             max_surface_chars: self.max_surface_chars,
+            singleton_ttl_days: self.singleton_ttl_days,
             dirty: self.dirty,
         };
-        persisted.evict();
+        persisted.prune_expired_singletons(now);
+        persisted.evict_at(now);
 
         let (file, temporary_path) = create_temporary_file(path)?;
         let write_result = (|| -> anyhow::Result<()> {
@@ -277,14 +298,13 @@ impl LearningCache {
         self.entries.values().map(|v| v.len()).sum()
     }
 
-    /// Evict lowest-score entries until total count is within `max_entries`.
-    fn evict(&mut self) {
+    /// Evict lowest-score entries using an injected timestamp.
+    fn evict_at(&mut self, now: u64) {
         let total = self.entry_count();
         if total <= self.max_entries {
             return;
         }
 
-        let now = now_unix();
         // Collect all entries with their (reading, index, score)
         let mut all: Vec<(String, usize, f64)> = Vec::with_capacity(total);
         for (reading, entries) in &self.entries {
@@ -318,9 +338,26 @@ impl LearningCache {
             }
         }
     }
+
+    /// Remove expired singleton entries before applying the capacity limit.
+    fn prune_expired_singletons(&mut self, now: u64) {
+        let ttl_days = self.singleton_ttl_days;
+        if ttl_days == 0 {
+            return;
+        }
+
+        let ttl_seconds = ttl_days.saturating_mul(SECONDS_PER_DAY);
+        self.entries.retain(|_, entries| {
+            entries.retain(|entry| {
+                entry.frequency != 1 || now.saturating_sub(entry.last_access) <= ttl_seconds
+            });
+            !entries.is_empty()
+        });
+    }
 }
 
 const MAX_TEMPORARY_FILE_ATTEMPTS: usize = 16;
+const SECONDS_PER_DAY: u64 = 86_400;
 
 fn normalized_parent_dir(path: &Path) -> &Path {
     match path.parent() {
@@ -363,14 +400,15 @@ fn create_temporary_file(path: &Path) -> anyhow::Result<(std::fs::File, PathBuf)
 /// Inspired by mozc's UserHistoryPredictor: recent selections rank higher,
 /// with a logarithmic frequency term to reward repeated use.
 fn score(entry: &LearningEntry, now: u64) -> f64 {
-    let age_days = if now > entry.last_access {
-        (now - entry.last_access) / 86400
-    } else {
-        0
-    };
+    let age_days = whole_age_days(now, entry.last_access);
     let recency = 1.0 / (1.0 + age_days as f64);
     let freq = (entry.frequency as f64).ln_1p();
     recency * 10.0 + freq
+}
+
+/// Compute elapsed whole days without underflow when a timestamp is ahead.
+fn whole_age_days(now: u64, last_access: u64) -> u64 {
+    now.saturating_sub(last_access) / 86400
 }
 
 /// Current time as Unix timestamp in seconds.
@@ -396,7 +434,25 @@ mod tests {
     fn cache_with(max_entries: usize) -> LearningCache {
         LearningCache::new(config_with(max_entries))
     }
+
+    fn cache_with_ttl(max_entries: usize, singleton_ttl_days: u64) -> LearningCache {
+        LearningCache::new(LearningConfig {
+            singleton_ttl_days,
+            ..config_with(max_entries)
+        })
+    }
+
+    fn entry(surface: &str, frequency: u32, last_access: u64) -> LearningEntry {
+        LearningEntry {
+            surface: surface.to_string(),
+            frequency,
+            last_access,
+        }
+    }
+
     use tempfile::NamedTempFile;
+
+    const DAY: u64 = 86_400;
 
     #[test]
     fn test_record_and_lookup() {
@@ -477,6 +533,166 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         cache.save(file.path()).unwrap();
         assert!(!cache.is_dirty());
+    }
+
+    #[test]
+    fn singleton_older_than_ttl_is_pruned_on_save() {
+        let now = 1_000_000_000;
+        let mut cache = cache_with_ttl(100, 7);
+        cache
+            .entries
+            .insert("old".to_string(), vec![entry("old", 1, now - 8 * DAY)]);
+        cache.entries.insert(
+            "recent".to_string(),
+            vec![entry("recent", 1, now - 7 * DAY)],
+        );
+        cache.dirty = true;
+
+        let file = NamedTempFile::new().unwrap();
+        cache.save_at(file.path(), now).unwrap();
+
+        assert!(!cache.entries.contains_key("old"));
+        assert!(cache.entries.contains_key("recent"));
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn singleton_exactly_ttl_days_old_is_retained() {
+        let now = 1_000_000_000;
+        let mut cache = cache_with_ttl(100, 7);
+        cache.entries.insert(
+            "boundary".to_string(),
+            vec![entry("boundary", 1, now - 7 * DAY)],
+        );
+        cache.dirty = true;
+
+        let file = NamedTempFile::new().unwrap();
+        cache.save_at(file.path(), now).unwrap();
+
+        assert!(cache.entries.contains_key("boundary"));
+    }
+
+    #[test]
+    fn singleton_one_second_past_ttl_is_pruned() {
+        let now = 1_000_000_000;
+        let mut cache = cache_with_ttl(100, 7);
+        cache.entries.insert(
+            "past-boundary".to_string(),
+            vec![entry("past-boundary", 1, now - 7 * DAY - 1)],
+        );
+        cache.dirty = true;
+
+        let file = NamedTempFile::new().unwrap();
+        cache.save_at(file.path(), now).unwrap();
+
+        assert!(!cache.entries.contains_key("past-boundary"));
+    }
+
+    #[test]
+    fn ttl_handles_future_timestamps_and_large_values() {
+        let now = u64::MAX - 1;
+        let mut cache = cache_with_ttl(100, u64::MAX);
+        cache
+            .entries
+            .insert("future".to_string(), vec![entry("future", 1, now + 1)]);
+        cache
+            .entries
+            .insert("old".to_string(), vec![entry("old", 1, 0)]);
+        cache.dirty = true;
+
+        let file = NamedTempFile::new().unwrap();
+        cache.save_at(file.path(), now).unwrap();
+
+        assert!(cache.entries.contains_key("future"));
+        assert!(cache.entries.contains_key("old"));
+    }
+
+    #[test]
+    fn old_repeated_entries_ignore_singleton_ttl() {
+        let now = 1_000_000_000;
+        let mut cache = cache_with_ttl(100, 7);
+        cache.entries.insert(
+            "repeated".to_string(),
+            vec![entry("repeated", 2, now - 365 * DAY)],
+        );
+        cache.dirty = true;
+
+        let file = NamedTempFile::new().unwrap();
+        cache.save_at(file.path(), now).unwrap();
+
+        assert!(cache.entries.contains_key("repeated"));
+    }
+
+    #[test]
+    fn zero_ttl_disables_singleton_pruning() {
+        let now = 1_000_000_000;
+        let mut cache = cache_with_ttl(100, 0);
+        cache
+            .entries
+            .insert("old".to_string(), vec![entry("old", 1, now - 365 * DAY)]);
+        cache.dirty = true;
+
+        let file = NamedTempFile::new().unwrap();
+        cache.save_at(file.path(), now).unwrap();
+
+        assert!(cache.entries.contains_key("old"));
+    }
+
+    #[test]
+    fn ttl_prunes_before_capacity_and_removes_empty_readings() {
+        let now = 1_000_000_000;
+        let mut cache = cache_with_ttl(2, 7);
+        cache.entries.insert(
+            "expired".to_string(),
+            vec![entry("expired", 1, now - 8 * DAY)],
+        );
+        cache.entries.insert(
+            "repeated".to_string(),
+            vec![entry("repeated", 2, now - 1_000 * DAY)],
+        );
+        cache
+            .entries
+            .insert("recent".to_string(), vec![entry("recent", 1, now)]);
+        cache.dirty = true;
+
+        let file = NamedTempFile::new().unwrap();
+        cache.save_at(file.path(), now).unwrap();
+
+        assert_eq!(cache.entry_count(), 2);
+        assert!(!cache.entries.contains_key("expired"));
+        assert!(cache.entries.contains_key("repeated"));
+        assert!(cache.entries.contains_key("recent"));
+    }
+
+    #[test]
+    fn ttl_replacement_failure_preserves_live_cache_and_destination() {
+        let now = 1_000_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("learning.tsv");
+        let original = b"# prior destination\nprior\tbytes\t1\t2\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut cache = cache_with_ttl(100, 7);
+        cache.entries.insert(
+            "expired".to_string(),
+            vec![entry("expired", 1, now - 8 * DAY)],
+        );
+        cache.entries.insert(
+            "repeated".to_string(),
+            vec![entry("repeated", 2, now - 365 * DAY)],
+        );
+        cache.dirty = true;
+
+        let result = cache.save_with_rename_at(&path, now, |_temporary, _destination| {
+            Err(std::io::Error::other("deterministic rename failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(cache.entry_count(), 2);
+        assert!(cache.entries.contains_key("expired"));
+        assert!(cache.entries.contains_key("repeated"));
+        assert!(cache.is_dirty());
     }
 
     #[test]
@@ -622,6 +838,7 @@ mod tests {
         let mut cache = LearningCache::new(LearningConfig {
             max_entries: 100,
             max_surface_chars: 5,
+            ..LearningConfig::default()
         });
 
         cache.record("あ", &"漢".repeat(6));
@@ -638,6 +855,7 @@ mod tests {
         let mut cache = LearningCache::new(LearningConfig {
             max_entries: 100,
             max_surface_chars: 5,
+            ..LearningConfig::default()
         });
 
         // Only the surface is capped; a long reading with a short surface
