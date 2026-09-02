@@ -9,13 +9,12 @@ Karukan は、Linux / macOS 向けの日本語入力システムです。
 
 - macOS
 - Xcode または Command Line Tools
-- Rust toolchain
-- `git` / `make`
+- Cargo
 
 ### インストール
 
 ```bash
-git clone <このリポジトリのURL>
+git clone -b <ブランチ名> <このリポジトリのURL>
 cd karukan/karukan-macos
 make install
 ```
